@@ -6,10 +6,12 @@ input_foreclosure_daily.json
 # State files (generated at runtime)
 last_run.json
 seen_ids.json
+nc_seen_ids.json
 captcha_failed_ids.json
 .ancestry_page_loads.json
 cookies.json
 datasift_cookies.json
+narrpr_cookies.json
 dropbox_state.json
 photo_state.json
 *.tmp

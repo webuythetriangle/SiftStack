@@ -10,7 +10,7 @@ import asyncio
 import logging
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import config
@@ -60,7 +60,8 @@ def _preflight_check(mode: str) -> list[str]:
 
     # ── Credential checks (mode-dependent) ──────────────────────────
     scrape_modes = {"daily", "historical"}
-    enrichment_modes = scrape_modes | {"pdf-import", "photo-import", "dropbox-watch", "csv-import"}
+    nc_scrape_modes = {"nc-daily", "nc-historical"}
+    enrichment_modes = scrape_modes | nc_scrape_modes | {"pdf-import", "photo-import", "dropbox-watch", "csv-import"}
     datasift_modes = {"manage-presets", "manage-sold", "phone-validate"}
 
     if mode in scrape_modes:
@@ -68,6 +69,10 @@ def _preflight_check(mode: str) -> list[str]:
             failures.append("TNPN_EMAIL / TNPN_PASSWORD not set (required for scraping)")
         if not config.CAPTCHA_API_KEY:
             failures.append("CAPTCHA_API_KEY not set (CAPTCHA solving will fail)")
+
+    if mode in nc_scrape_modes:
+        if not config.CAPTCHA_API_KEY:
+            failures.append("CAPTCHA_API_KEY not set (Turnstile solving on ncnotices.com will fail)")
 
     if mode in enrichment_modes:
         # These are warnings, not blockers — pipeline degrades gracefully
@@ -100,8 +105,17 @@ def _preflight_check(mode: str) -> list[str]:
         except Exception as e:
             failures.append(f"Cannot reach tnpublicnotice.com: {e}")
 
+    if mode in nc_scrape_modes:
+        import requests as _requests
+        try:
+            resp = _requests.head(config.NC_BASE_URL, timeout=10, allow_redirects=True)
+            if resp.status_code >= 500:
+                failures.append(f"ncnotices.com returned {resp.status_code} — site may be down")
+        except Exception as e:
+            failures.append(f"Cannot reach ncnotices.com: {e}")
+
     # ── 2Captcha balance check ──────────────────────────────────────
-    if mode in scrape_modes and config.CAPTCHA_API_KEY:
+    if mode in (scrape_modes | nc_scrape_modes) and config.CAPTCHA_API_KEY:
         import requests as _requests
         try:
             resp = _requests.get(
@@ -638,6 +652,7 @@ def _run_pdf_import(args) -> None:
         skip_obituary=args.skip_obituary,
         skip_ancestry=getattr(args, "skip_ancestry", False),
         skip_entity_research=not getattr(args, "research_entities", False),
+        skip_narrpr=getattr(args, "no_narrpr", False),
         skip_vacant_filter=getattr(args, "include_vacant", False),
         skip_commercial_filter=getattr(args, "include_commercial", False),
         skip_entity_filter=getattr(args, "include_entities", False),
@@ -717,6 +732,7 @@ def _run_photo_import(args) -> None:
         skip_obituary=args.skip_obituary,
         skip_ancestry=getattr(args, "skip_ancestry", False),
         skip_entity_research=not getattr(args, "research_entities", False),
+        skip_narrpr=getattr(args, "no_narrpr", False),
         skip_heir_verification=args.skip_heir_verification,
         max_heir_depth=args.max_heir_depth,
         skip_dm_address=args.skip_dm_address,
@@ -817,6 +833,7 @@ def _run_csv_import(args) -> None:
         skip_obituary=args.skip_obituary,
         skip_ancestry=getattr(args, "skip_ancestry", False),
         skip_entity_research=not getattr(args, "research_entities", False),
+        skip_narrpr=getattr(args, "no_narrpr", False),
         skip_heir_verification=args.skip_heir_verification,
         max_heir_depth=args.max_heir_depth,
         skip_dm_address=args.skip_dm_address,
@@ -1016,7 +1033,8 @@ def cli_main() -> None:
     parser.add_argument(
         "mode",
         choices=[
-            "daily", "historical", "pdf-import", "photo-import", "dropbox-watch",
+            "daily", "historical", "nc-daily", "nc-historical",
+            "pdf-import", "photo-import", "dropbox-watch",
             "csv-import", "phone-validate", "manage-sold", "manage-presets",
             # New analysis & workflow modes
             "comp", "rehab", "analyze-deal", "market-analysis", "buyer-prospect",
@@ -1227,6 +1245,13 @@ def cli_main() -> None:
         "--research-entities",
         action="store_true",
         help="Research entity-owned properties to find the person behind LLCs/Corps (web search + LLM)",
+    )
+    parser.add_argument(
+        "--no-narrpr",
+        action="store_true",
+        help="Skip pulling RVM valuation data from your NARRPR/RPR account (on by default when "
+             "NARRPR_EMAIL/PASSWORD are set). RPR enforces one session per account, so unless you "
+             "pass this flag, the run will sign you out of any active narrpr.com session.",
     )
     # Buy box / filter toggles — control which property types pass through
     parser.add_argument(
@@ -1683,6 +1708,11 @@ def cli_main() -> None:
         _run_csv_import(args)
         return
 
+    # NC (ncnotices.com) scrape mode — separate pipeline
+    if args.mode in ("nc-daily", "nc-historical"):
+        _run_nc_scrape_pipeline(args)
+        return
+
     # Filter saved searches
     counties = None
     if args.counties and args.counties.lower() != "all":
@@ -1751,6 +1781,7 @@ def _run_scrape_pipeline(args, searches) -> None:
         skip_obituary=args.skip_obituary,
         skip_ancestry=getattr(args, "skip_ancestry", False),
         skip_entity_research=not getattr(args, "research_entities", False),
+        skip_narrpr=getattr(args, "no_narrpr", False),
         skip_heir_verification=args.skip_heir_verification,
         max_heir_depth=args.max_heir_depth,
         skip_dm_address=args.skip_dm_address,
@@ -1897,6 +1928,108 @@ def _run_scrape_pipeline(args, searches) -> None:
                       "Will check DataSift Incomplete tab via Playwright in a future build.")
 
     logging.info("Done — %d notices exported", len(notices))
+
+
+def _filter_nc_searches(counties: list[str] | None, types: list[str] | None):
+    """Filter config.NC_SAVED_SEARCHES by county and/or notice type."""
+    searches = list(config.NC_SAVED_SEARCHES)
+    if counties:
+        county_set = {c.lower() for c in counties}
+        searches = [s for s in searches if s.county.lower() in county_set]
+    if types:
+        type_set = {t.lower() for t in types}
+        searches = [s for s in searches if s.notice_type.lower() in type_set]
+    return searches
+
+
+def _run_nc_scrape_pipeline(args) -> None:
+    """Run the ncnotices.com (NC) scrape → light enrichment → export pipeline.
+
+    Deliberately lean compared to _run_scrape_pipeline: skips the TN-specific
+    enrichers (Knox Tax API parcel lookup, obituary/Ancestry deceased-owner
+    research) since they don't apply to NC counties. Only Smarty address
+    standardization runs (a national USPS-based service, safe for NC addresses).
+    """
+    from ncnotices_scraper import scrape_all_nc
+
+    counties = None
+    if args.counties and args.counties.lower() != "all":
+        counties = [c.strip() for c in args.counties.split(",")]
+    types = None
+    if args.types and args.types.lower() != "all":
+        types = [t.strip() for t in args.types.split(",")]
+
+    searches = _filter_nc_searches(counties, types)
+    if not searches:
+        logging.error("No NC saved searches match the given --counties / --types filters")
+        sys.exit(1)
+
+    logging.info(
+        "Running %d NC searches: %s",
+        len(searches),
+        ", ".join(f"{s.county}/{s.keyword}" for s in searches),
+    )
+
+    days_back = None
+    if args.since:
+        try:
+            since_dt = datetime.strptime(args.since, "%Y-%m-%d")
+            days_back = max(1, (datetime.now() - since_dt).days)
+        except ValueError:
+            logging.error("--since must be YYYY-MM-DD")
+            sys.exit(1)
+    elif args.mode == "nc-historical":
+        days_back = 365
+    else:
+        days_back = 7
+
+    mode = "historical" if args.mode == "nc-historical" else "daily"
+
+    # Cross-run dedup (mirrors scraper.py's load_seen_ids/save_seen_ids for TN).
+    # Without this, nc-daily's fixed 7-day lookback would re-scrape and
+    # re-upload the same notices to DataSift every single day.
+    nc_seen_ids = config.load_state(config.NC_SEEN_IDS_FILE)
+    cutoff = (datetime.now() - timedelta(days=config.SEEN_IDS_PRUNE_DAYS)).strftime("%Y-%m-%d")
+    nc_seen_ids = {nid: d for nid, d in nc_seen_ids.items() if d >= cutoff}
+
+    notices = asyncio.run(scrape_all_nc(
+        mode=mode, searches=searches, days_back=days_back,
+        max_notices=args.max_notices, seen_ids=nc_seen_ids,
+    ))
+    config.save_state(config.NC_SEEN_IDS_FILE, nc_seen_ids)
+
+    from enrichment_pipeline import PipelineOptions, run_enrichment_pipeline
+
+    opts = PipelineOptions(
+        skip_parcel_lookup=True,
+        skip_tax=True,
+        skip_zillow=getattr(args, "skip_zillow", False),
+        skip_smarty=getattr(args, "skip_smarty", False),
+        skip_geocode=getattr(args, "skip_geocode", False),
+        skip_obituary=True,
+        skip_ancestry=True,
+        skip_narrpr=getattr(args, "no_narrpr", False),
+        skip_vacant_filter=getattr(args, "include_vacant", False),
+        skip_commercial_filter=getattr(args, "include_commercial", False),
+        skip_entity_filter=getattr(args, "include_entities", False),
+        source_label=f"NC CLI {args.mode}",
+    )
+    notices = run_enrichment_pipeline(notices, opts)
+
+    if not notices:
+        logging.warning("No NC notices found")
+        sys.exit(0)
+
+    if args.split:
+        paths = write_csv_by_type(notices)
+        for p in paths:
+            logging.info("Output: %s", p)
+    else:
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+        path = write_csv(notices, filename=f"nc_notices_{timestamp}.csv")
+        logging.info("Output: %s", path)
+
+    logging.info("Done — %d NC notices exported", len(notices))
 
 
 # ── Entry point ───────────────────────────────────────────────────────

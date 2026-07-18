@@ -60,6 +60,12 @@ class NoticeData:
     sqft: str = ""
     year_built: str = ""
     lot_size: str = ""             # Lot size in sqft
+    # NARRPR (RPR) RVM enrichment fields — cross-check against Zestimate above
+    rvm_value: str = ""             # RVM point estimate ($)
+    rvm_value_low: str = ""         # RVM estimated range, low end ($)
+    rvm_value_high: str = ""        # RVM estimated range, high end ($)
+    rvm_confidence: str = ""        # RVM confidence score, 0-100
+    rvm_updated_date: str = ""      # Date RPR last recalculated the RVM
     # Probate-specific fields
     decedent_name: str = ""        # Deceased person's name (probate only)
     owner_street: str = ""         # PR/contact mailing street address
@@ -562,6 +568,18 @@ AUCTION_DATE_PATTERNS = [
     # "notice is hereby given that on DATE" — HUD foreclosure notices
     re.compile(
         r"notice\s+is\s+hereby\s+given\s+that\s+on\s+" + _DATE_FRAGMENT,
+        re.IGNORECASE,
+    ),
+    # "... for conducting the sale on July 7, 2026 at 12:30 PM" — generic
+    # "sale on DATE" catch-all, seen in NC substitute-trustee notices.
+    re.compile(
+        r"\bsale\s+on\s+" + _DATE_FRAGMENT,
+        re.IGNORECASE,
+    ),
+    # "at 11:00AM on July 30, 2026" — time-then-date order, seen in NC
+    # "expose for sale at public auction ... at TIME on DATE" notices.
+    re.compile(
+        r"\bat\s+\d{1,2}:\d{2}\s*(?:[AP]\.?M\.?)?\s+on\s+" + _DATE_FRAGMENT,
         re.IGNORECASE,
     ),
 ]

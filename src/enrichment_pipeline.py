@@ -41,6 +41,7 @@ class PipelineOptions:
     skip_smarty: bool = False
     skip_geocode: bool = False
     skip_zillow: bool = False
+    skip_narrpr: bool = False   # on by default; opt out via --no-narrpr (single-session account)
     skip_obituary: bool = False
     skip_ancestry: bool = False
 
@@ -508,6 +509,25 @@ def run_enrichment_pipeline(
     elif opts.skip_zillow:
         logger.info("── Step 8: Zillow (skipped) ──")
 
+    # ── Step 8b: NARRPR RVM Enrichment (opt-in) ──────────────────────
+    if not opts.skip_narrpr:
+        if config.NARRPR_EMAIL and config.NARRPR_PASSWORD:
+            logger.info("── Step 8b: NARRPR RVM Enrichment ──")
+            try:
+                from narrpr_enricher import enrich_rvm_data
+
+                enrich_rvm_data(notices)
+                enriched = sum(1 for n in notices if n.rvm_value)
+                logger.info("  RVM-enriched: %d/%d", enriched, len(notices))
+            except ImportError:
+                logger.warning("  narrpr_enricher not available — skipping")
+            except Exception as e:
+                logger.warning("  NARRPR enrichment failed: %s", e)
+        else:
+            logger.info("── Step 8b: NARRPR (no credentials configured) ──")
+    else:
+        logger.info("── Step 8b: NARRPR (skipped — disabled via --no-narrpr) ──")
+
     # ── Step 9: Obituary Enrichment ──────────────────────────────────
     if not opts.skip_obituary and not opts.has_obituary:
         if config.ANTHROPIC_API_KEY:
@@ -627,6 +647,11 @@ def _log_summary(notices: list[NoticeData], opts: PipelineOptions) -> None:
         if equity_values:
             avg_equity = sum(equity_values) / len(equity_values)
             logger.info("  Avg estimated equity: $%s", f"{avg_equity:,.0f}")
+
+    # NARRPR RVM
+    rvm_enriched = sum(1 for n in notices if n.rvm_value)
+    if rvm_enriched:
+        logger.info("  RVM-enriched: %d/%d", rvm_enriched, total)
 
     # Tax
     tax_enriched = sum(1 for n in notices if n.tax_delinquent_years)

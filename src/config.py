@@ -16,6 +16,7 @@ OUTPUT_DIR = PROJECT_ROOT / "output"
 LOG_DIR = PROJECT_ROOT / "logs"
 STATE_FILE = PROJECT_ROOT / "last_run.json"
 SEEN_IDS_FILE = PROJECT_ROOT / "seen_ids.json"
+NC_SEEN_IDS_FILE = PROJECT_ROOT / "nc_seen_ids.json"
 SEEN_IDS_PRUNE_DAYS = 90
 # Notices that exhausted all CAPTCHA retries during scraping.
 # Persisted so the next run's summary can surface them instead of
@@ -54,6 +55,8 @@ ANCESTRY_PASSWORD = os.getenv("ANCESTRY_PASSWORD", "")
 DROPBOX_APP_KEY = os.getenv("DROPBOX_APP_KEY", "")            # Dropbox OAuth2 app key
 DROPBOX_APP_SECRET = os.getenv("DROPBOX_APP_SECRET", "")
 DROPBOX_REFRESH_TOKEN = os.getenv("DROPBOX_REFRESH_TOKEN", "")
+NARRPR_EMAIL = os.getenv("NARRPR_EMAIL", "")                  # narrpr.com (RPR) login
+NARRPR_PASSWORD = os.getenv("NARRPR_PASSWORD", "")
 
 # ── LLM Backend ──────────────────────────────────────────────────────
 LLM_BACKEND = os.getenv("LLM_BACKEND", "anthropic")           # "anthropic", "ollama", or "openrouter"
@@ -118,6 +121,63 @@ class SavedSearch:
 SAVED_SEARCHES: list[SavedSearch] = [
     SavedSearch("Knox", "foreclosure", "Foreclosure V2 Knox"),
     SavedSearch("Blount", "foreclosure", "Foreclosure V2 Blount"),
+]
+
+# ── ncnotices.com (North Carolina Press Association public notices) ────
+# Second scrape source, added for NC market expansion (Wake, Durham, Orange,
+# Guilford, Mecklenburg counties). Built on the same WebStrides ASP.NET
+# platform as tnpublicnotice.com but with a keyword-search model instead of
+# named saved searches, and Cloudflare Turnstile (not Google reCAPTCHA) gating
+# each notice detail page. No login is required for basic search.
+NC_BASE_URL = "https://www.ncnotices.com"
+NC_SEARCH_URL = f"{NC_BASE_URL}/Search.aspx"
+
+# Search form (Search.aspx) — county/date panels are collapsed by default
+# and must be opened (click the toggle div) before their inputs are usable.
+NC_SEL_SEARCH_KEYWORD = "#ctl00_ContentPlaceHolder1_as1_txtSearch"
+NC_SEL_COUNTY_TOGGLE = "#ctl00_ContentPlaceHolder1_as1_divCounty"
+NC_SEL_COUNTY_LIST = "#ctl00_ContentPlaceHolder1_as1_lstCounty"
+NC_SEL_DATE_TOGGLE = "#ctl00_ContentPlaceHolder1_as1_divDateRange"
+NC_SEL_LAST_NUM_DAYS_RADIO = "#ctl00_ContentPlaceHolder1_as1_rbLastNumDays"
+NC_SEL_LAST_NUM_DAYS_INPUT = "#ctl00_ContentPlaceHolder1_as1_txtLastNumDays"
+NC_SEL_SEARCH_SUBMIT = "#ctl00_ContentPlaceHolder1_as1_btnGo"
+
+# Search results grid
+NC_SEL_VIEW_BUTTON_PATTERN = "input[id$='btnView2']"
+NC_SEL_NEXT_PAGE_BUTTON = "input[title='Next page']"
+NC_SEL_PAGE_INFO = "td:has-text('Page ')"
+NC_SEL_PER_PAGE_DROPDOWN = 'select[name$="ddlPerPage"]'
+
+# Notice detail page — Cloudflare Turnstile gate (not Google reCAPTCHA)
+NC_TURNSTILE_SITEKEY = "0x4AAAAAADs-29tdUBxeI6cO"
+NC_SEL_TURNSTILE_RESPONSE = "input[name='cf-turnstile-response']"
+NC_SEL_VIEW_NOTICE_BUTTON = "#ctl00_ContentPlaceHolder1_PublicNoticeDetailsBody1_btnViewNotice"
+
+
+@dataclass
+class NCSearch:
+    """Represents a keyword search on ncnotices.com (county + notice type + keyword)."""
+    county: str
+    notice_type: str  # Only "foreclosure" is supported today — see NC_SAVED_SEARCHES note
+    keyword: str
+
+
+# ── NC Saved Searches ───────────────────────────────────────────────────
+# ncnotices.com is a general legal-notice aggregator with a free-text keyword
+# search, not a fixed category taxonomy — there is no "Probate", "Tax Sale",
+# "Tax Delinquent", "Eviction", or "Code Violation" search category here.
+# Only foreclosure sale notices (published under NCGS 45-21.17) are reliably
+# findable via keyword search. The other 5 notice types live on different NC
+# systems entirely (NC eCourts/Odyssey for probate + eviction, wake.gov bulk
+# files for tax delinquency, county Sheriff's office for tax sale, and
+# city/county code-enforcement portals for code violations) and need their
+# own separate integrations — not in scope here.
+NC_SAVED_SEARCHES: list[NCSearch] = [
+    NCSearch("Wake", "foreclosure", "foreclosure"),
+    NCSearch("Durham", "foreclosure", "foreclosure"),
+    NCSearch("Orange", "foreclosure", "foreclosure"),
+    NCSearch("Guilford", "foreclosure", "foreclosure"),
+    NCSearch("Mecklenburg", "foreclosure", "foreclosure"),
 ]
 
 # ── Entity Detection ──────────────────────────────────────────────────

@@ -348,6 +348,44 @@ python src/extract_market_finder.py --state "Tennessee" --county "Knox,Blount" -
 # Output: JSON file in output/market_finder_{state}_{county}_{timestamp}.json
 ```
 
+## NARRPR (RPR) RVM Enrichment (opt-in, build 1.0.30+)
+
+Enrichment step that pulls **RVM (RPR Valuation Model)** data from the user's NARRPR (narrpr.com / Realtors Property Resource) account — a second AVM to cross-check against the Zillow Zestimate already captured in `estimated_value`. On by default whenever `NARRPR_EMAIL` / `NARRPR_PASSWORD` are set in `.env` (`skip_narrpr: bool = False` on `PipelineOptions`); disable per-run with `--no-narrpr` on any CLI entry point (including the NC `nc-daily`/`nc-historical` modes). No-ops with a log line if credentials aren't configured.
+
+### Key Files
+- `src/narrpr_enricher.py` — `NarrprSession` (Playwright login + direct API calls) and `enrich_rvm_data(notices)` (sync entry point called by `enrichment_pipeline.py`)
+
+### Critical Design Constraint: Single-Session Accounts
+
+**RPR enforces exactly one concurrent session per account.** Logging in anywhere — including the user's own browser — immediately signs out every other active session, and a popup ("Another user detected... has been signed out") confirms it happened. This was confirmed live: an automated login bumped the user's own manual session.
+
+Consequences for this module:
+- **No disk-persisted cookie reuse across separate runs.** Unlike `datasift_core.py`'s `cookies.json` pattern, saving NARRPR session cookies to disk provides no benefit — any subsequent login (by the user manually, or by a later script run) invalidates the earlier session anyway. `narrpr_enricher.py` deliberately does NOT persist cookies; it authenticates once per run and holds that one browser session for the entire batch.
+- **Running enrichment while the user is actively using narrpr.com will sign them out**, and vice versa. Since this now runs by default on every pipeline run, schedule automated runs (including the daily Apify cron) for times the user isn't in RPR, or pass `--no-narrpr` on runs where that matters.
+- **The bearer token expires after ~1 hour** (JWT `exp` = `iat` + 3600s). `enrich_rvm_data()` does not attempt token refresh — batches that could run longer should be chunked externally.
+
+### No Public API — Direct JSON Endpoints (not page scraping)
+
+Unlike DataSift's UI-automation pattern, RPR's Angular SPA turned out to have clean, well-structured JSON endpoints under `webapi.narrpr.com` that can be called directly via Playwright's `context.request` after a single login — **no per-property page navigation needed**. This was discovered by sniffing XHR/fetch traffic (`page.on("response")`) while manually driving the UI, not from any documentation.
+
+**Auth mechanism:** After login, an OIDC access token JWT is readable from the non-httpOnly `oidc.at` cookie on `www.narrpr.com` (1-hour expiry). Extract it once and send as `Authorization: Bearer <token>` on every subsequent API call — the Angular app does this itself via JS, but raw HTTP calls must set the header manually since Playwright's request context doesn't execute page JS.
+
+**Three-call chain to go from a free-text address to RVM data:**
+1. `GET webapi.narrpr.com/misc/location-suggestions?userQuery={address}&userLatitude=...&userLongitude=...&category=1&getPlacesAreasAndProperties=true&getStreets=false&getListingIdsApnsAndTaxIds=false&getSchools=false` → returns `sections[0].locations[0].propertyId` (or an empty list if no match — vacant land and off-market parcels can still resolve here, but see step 3).
+2. `GET webapi.narrpr.com/properties/{propertyId}/common?preferredPropertyMode=1` → returns `orgId`, `listingId`, `zipPlaceId`, `propertyMode` needed for step 3, plus a raw `estimatedValue` int (the RVM point estimate, when one exists).
+3. `GET webapi.narrpr.com/properties/{propertyId}/details?orgId=&listingId=&zipPlaceId=&propertyMode=&sections=43` → `summarySection.hasEstimatedValue` (bool — **false for vacant land and commercial/special-purpose buildings**, RVM only applies to residential), `estimatedRangeFrom`/`estimatedRangeTo` (exact ints, not the rounded "$630.8K" shown in the UI), `estimatedValueConfidenceScore` (0-100, shown as 1-5 stars in the UI), `estimatedValueDate`, `last1MonthChangeAmount`, `last12MonthChangePercent`.
+
+`userLatitude`/`userLongitude` on the geocode call bias ambiguous matches toward a market — hardcoded to Knoxville, TN centroid (`35.9606, -83.9207`) since this project's addresses are all Knox/Blount County.
+
+### Verified Behavior
+- Active residential listing (single-family, has MLS listing): full RVM data returned (`hasEstimatedValue: true`).
+- Vacant land parcel: geocode resolves to a real `propertyId`, but `hasEstimatedValue: false` — no RVM range/confidence populated. `enrich_rvm_data()` leaves `rvm_*` fields blank rather than guessing.
+- Commercial/special-purpose building (e.g., an office/bank building): same — resolves to a real property, no RVM.
+- A street name with no house number can still resolve to exactly one `propertyId` if RPR's index only has one addressable parcel matching that broad query — don't assume a bare street name always returns a "several matches" list.
+
+### `NoticeData` Fields (added to `notice_parser.py`)
+`rvm_value`, `rvm_value_low`, `rvm_value_high`, `rvm_confidence` (0-100), `rvm_updated_date` — placed alongside the existing Zillow fields (`estimated_value`, etc.) for side-by-side AVM comparison.
+
 ## REI Skill Library (13 Skills)
 
 Distribution-ready Claude Co-Work skill files at `Skills for REI/improved/`. Each `.skill` is a ZIP containing `SKILL.md` + `references/` folder. Plugins (`.plugin`) also include `commands/` and `.claude-plugin/plugin.json`.
