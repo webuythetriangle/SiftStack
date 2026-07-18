@@ -1,0 +1,116 @@
+name: Daily SiftStack Pipeline
+
+# Runs the TN (tnpublicnotice.com) and NC (ncnotices.com) daily scrapes,
+# enrichment, and DataSift upload. Scheduled cron is UTC — 12:00 UTC is
+# ~7-8am Eastern depending on DST. Adjust to a time you're NOT actively
+# using narrpr.com: RPR only allows one signed-in session per account, and
+# this job's NARRPR enrichment step will sign out any concurrent manual
+# session (see CLAUDE.md "Critical Design Constraint: Single-Session
+# Accounts").
+on:
+  schedule:
+    - cron: "0 12 * * *"
+  workflow_dispatch: {}
+
+jobs:
+  daily-pipeline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install system dependencies (Tesseract OCR)
+        run: sudo apt-get update && sudo apt-get install -y tesseract-ocr
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Install Playwright Chromium
+        run: python -m playwright install --with-deps chromium
+
+      # Cross-run state (last_run.json, seen_ids.json, nc_seen_ids.json,
+      # cookies.json, datasift_cookies.json) must persist between scheduled
+      # runs or every run re-scrapes/re-uploads the same trailing window.
+      # GitHub Actions cache entries are immutable per key, so we restore
+      # from the most recent prior key and always save under a fresh
+      # run-id key (the standard pattern for state across scheduled runs).
+      - name: Restore scraper state
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            last_run.json
+            seen_ids.json
+            nc_seen_ids.json
+            captcha_failed_ids.json
+            cookies.json
+            datasift_cookies.json
+          key: siftstack-state-${{ github.run_id }}
+          restore-keys: |
+            siftstack-state-
+
+      - name: Run TN daily scrape
+        id: tn_daily
+        env:
+          TNPN_EMAIL: ${{ secrets.TNPN_EMAIL }}
+          TNPN_PASSWORD: ${{ secrets.TNPN_PASSWORD }}
+          CAPTCHA_API_KEY: ${{ secrets.CAPTCHA_API_KEY }}
+          DATASIFT_EMAIL: ${{ secrets.DATASIFT_EMAIL }}
+          DATASIFT_PASSWORD: ${{ secrets.DATASIFT_PASSWORD }}
+          SMARTY_AUTH_ID: ${{ secrets.SMARTY_AUTH_ID }}
+          SMARTY_AUTH_TOKEN: ${{ secrets.SMARTY_AUTH_TOKEN }}
+          OPENWEBNINJA_API_KEY: ${{ secrets.OPENWEBNINJA_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          SERPER_API_KEY: ${{ secrets.SERPER_API_KEY }}
+          FIRECRAWL_API_KEY: ${{ secrets.FIRECRAWL_API_KEY }}
+          TRACERFY_API_KEY: ${{ secrets.TRACERFY_API_KEY }}
+          TRESTLE_API_KEY: ${{ secrets.TRESTLE_API_KEY }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          NARRPR_EMAIL: ${{ secrets.NARRPR_EMAIL }}
+          NARRPR_PASSWORD: ${{ secrets.NARRPR_PASSWORD }}
+          ANCESTRY_EMAIL: ${{ secrets.ANCESTRY_EMAIL }}
+          ANCESTRY_PASSWORD: ${{ secrets.ANCESTRY_PASSWORD }}
+        run: python src/main.py daily --upload-datasift --notify-slack
+
+      - name: Run NC daily scrape
+        id: nc_daily
+        if: always()
+        env:
+          CAPTCHA_API_KEY: ${{ secrets.CAPTCHA_API_KEY }}
+          DATASIFT_EMAIL: ${{ secrets.DATASIFT_EMAIL }}
+          DATASIFT_PASSWORD: ${{ secrets.DATASIFT_PASSWORD }}
+          SMARTY_AUTH_ID: ${{ secrets.SMARTY_AUTH_ID }}
+          SMARTY_AUTH_TOKEN: ${{ secrets.SMARTY_AUTH_TOKEN }}
+          OPENWEBNINJA_API_KEY: ${{ secrets.OPENWEBNINJA_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          NARRPR_EMAIL: ${{ secrets.NARRPR_EMAIL }}
+          NARRPR_PASSWORD: ${{ secrets.NARRPR_PASSWORD }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: python src/main.py nc-daily --upload-datasift --notify-slack
+
+      - name: Save scraper state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            last_run.json
+            seen_ids.json
+            nc_seen_ids.json
+            captcha_failed_ids.json
+            cookies.json
+            datasift_cookies.json
+          key: siftstack-state-${{ github.run_id }}
+
+      - name: Notify Slack on failure
+        if: failure()
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          curl -sf -X POST -H 'Content-type: application/json' \
+            --data "{\"text\": \":rotating_light: SiftStack daily pipeline failed — run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"}" \
+            "$SLACK_WEBHOOK_URL"
