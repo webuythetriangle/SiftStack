@@ -95,6 +95,17 @@ jobs:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         run: python src/main.py nc-daily --upload-datasift --notify-slack
 
+      - name: Upload output CSVs
+        # nc_daily exits before writing a CSV when no new notices are found,
+        # so output/ is empty in that case — skip the artifact entirely
+        # instead of publishing an empty one.
+        if: always() && hashFiles('output/**') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: siftstack-output-${{ github.run_id }}
+          path: output/
+          retention-days: 30
+
       - name: Save scraper state
         if: always()
         uses: actions/cache/save@v4

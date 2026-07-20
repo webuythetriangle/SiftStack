@@ -2018,6 +2018,14 @@ def _run_nc_scrape_pipeline(args) -> None:
 
     if not notices:
         logging.warning("No NC notices found")
+        # Send a Slack/Discord ping even on empty runs so operators know the
+        # job ran successfully (vs silently dying) — mirrors _run_scrape_pipeline.
+        if getattr(args, "notify_slack", False):
+            try:
+                from slack_notifier import send_slack_notification
+                send_slack_notification([])
+            except Exception:
+                logging.exception("Slack notification for empty run failed")
         sys.exit(0)
 
     if args.split:
@@ -2028,6 +2036,46 @@ def _run_nc_scrape_pipeline(args) -> None:
         timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
         path = write_csv(notices, filename=f"nc_notices_{timestamp}.csv")
         logging.info("Output: %s", path)
+
+    # DataSift upload (same logic as TN daily/historical mode)
+    upload_result = None
+    if getattr(args, "upload_datasift", False):
+        from datasift_formatter import write_datasift_split_csvs
+        from datasift_uploader import upload_datasift_split, upload_to_datasift
+
+        do_enrich = not getattr(args, "no_enrich", False)
+        do_skip_trace = not getattr(args, "no_skip_trace", False)
+
+        csv_infos = write_datasift_split_csvs(notices)
+        for info in csv_infos:
+            logging.info("DataSift CSV (%s): %s", info["label"], info["path"])
+
+        if len(csv_infos) > 1:
+            upload_result = asyncio.run(
+                upload_datasift_split(
+                    csv_infos,
+                    enrich=do_enrich,
+                    skip_trace=do_skip_trace,
+                )
+            )
+        else:
+            upload_result = asyncio.run(
+                upload_to_datasift(
+                    csv_infos[0]["path"],
+                    enrich=do_enrich,
+                    skip_trace=do_skip_trace,
+                )
+            )
+
+        if upload_result.get("success"):
+            logging.info("DataSift upload: %s", upload_result.get("message", "OK"))
+        else:
+            logging.error("DataSift upload failed: %s", upload_result.get("message"))
+
+    # Slack/Discord notification
+    if getattr(args, "notify_slack", False):
+        from slack_notifier import send_slack_notification
+        send_slack_notification(notices, upload_result=upload_result)
 
     logging.info("Done — %d NC notices exported", len(notices))
 
