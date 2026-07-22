@@ -262,8 +262,7 @@ def run_enrichment_pipeline(
       1. Filter sold properties
       2. Deduplicate
       3. Vacant land filter
-      4. Parcel address lookup
-      5. Tax delinquency enrichment
+      5. Tax delinquency enrichment (NC only — see Step 5 below)
       6. Smarty address standardization
       7. Reverse geocode + Smarty retry
       8. Zillow property enrichment
@@ -346,66 +345,28 @@ def run_enrichment_pipeline(
         logger.warning("No records remaining after filtering")
         return notices
 
-    # ── Step 3c: Probate Property Lookup ────────────────────────────
-    # For probate records without a property address, search Knox Tax API
-    # by the decedent's name to find their property.
-    probate_no_addr = [
-        n for n in notices
-        if n.notice_type == "probate"
-        and not n.address.strip()
-        and n.decedent_name.strip()
-        and n.county.lower() == "knox"
-    ]
-    if probate_no_addr:
-        logger.info("── Step 3c: Probate Property Lookup (%d candidates) ──", len(probate_no_addr))
-        try:
-            from tax_enricher import _probate_property_lookup
-            _probate_property_lookup(probate_no_addr)
-            found = sum(1 for n in probate_no_addr if n.address.strip())
-            logger.info("  Property address found: %d/%d", found, len(probate_no_addr))
-        except ImportError:
-            logger.warning("  _probate_property_lookup not available — skipping")
-        except Exception as e:
-            logger.warning("  Probate property lookup failed: %s", e)
-
-    # ── Step 4: Parcel Address Lookup ────────────────────────────────
-    if not opts.skip_parcel_lookup and not opts.skip_tax:
-        candidates = [
-            n
-            for n in notices
-            if n.parcel_id.strip() and n.county.lower() == "knox"
-        ]
-        if candidates:
-            logger.info(
-                "── Step 4: Parcel Address Lookup (%d candidates) ──",
-                len(candidates),
-            )
-            try:
-                from tax_enricher import lookup_parcel_addresses
-
-                lookup_parcel_addresses(notices)
-            except ImportError:
-                logger.warning("  tax_enricher not available — skipping")
-            except Exception as e:
-                logger.warning("  Parcel address lookup failed: %s", e)
-        else:
-            logger.info("── Step 4: Parcel Address Lookup (no candidates) ──")
-    elif opts.skip_parcel_lookup:
-        logger.info("── Step 4: Parcel Address Lookup (skipped) ──")
+    # ── Step 3c/4: Knox County probate property lookup + parcel address
+    # lookup (tax_enricher._probate_property_lookup / lookup_parcel_addresses)
+    # removed — both were Knox-County-TN-only. skip_parcel_lookup stays on
+    # PipelineOptions since actor_main() (Apify Actor / TN) still passes it.
 
     # ── Step 5: Tax Delinquency ──────────────────────────────────────
+    # NC-only now — Knox County's tax_enricher.enrich_tax_delinquency() call
+    # was removed here (see Step 3c/4 note above); tax_enricher.py itself is
+    # untouched and still used by actor_main()'s TN pipeline.
     if not opts.skip_tax and not opts.has_tax:
         logger.info("── Step 5: Tax Delinquency Enrichment ──")
         try:
-            from tax_enricher import enrich_tax_delinquency
+            from nc_tax_enricher import enrich_nc_tax_delinquency
 
-            enrich_tax_delinquency(notices)
-            enriched = sum(1 for n in notices if n.tax_delinquent_years)
-            logger.info("  Tax-delinquent: %d/%d", enriched, len(notices))
+            enrich_nc_tax_delinquency(notices)
         except ImportError:
-            logger.warning("  tax_enricher not available — skipping")
+            logger.warning("  nc_tax_enricher not available — skipping")
         except Exception as e:
-            logger.warning("  Tax enrichment failed: %s", e)
+            logger.warning("  NC tax enrichment failed: %s", e)
+
+        enriched = sum(1 for n in notices if n.tax_delinquent_years)
+        logger.info("  Tax-delinquent: %d/%d", enriched, len(notices))
     elif opts.has_tax:
         logger.info("── Step 5: Tax Delinquency (preserved — data already present) ──")
     elif opts.skip_tax:
@@ -566,6 +527,34 @@ def run_enrichment_pipeline(
         )
     elif opts.skip_obituary:
         logger.info("── Step 9: Obituary (skipped) ──")
+
+    # ── Step 9a: Property Registry Reconciliation ───────────────────
+    # Merge each notice onto its previously-known record (from this run's
+    # earlier same-property notices, or a prior run) so a re-published/
+    # amended notice updates the existing lead instead of duplicating it.
+    logger.info("── Step 9a: Property Registry Reconciliation ──")
+    try:
+        from property_registry import (
+            load_registry,
+            reconcile_with_registry,
+            save_registry,
+            update_registry,
+        )
+
+        registry = load_registry()
+        notices, updated_count = reconcile_with_registry(notices, registry)
+        if updated_count:
+            logger.info(
+                "  %d/%d properties matched a previously-scraped lead — merged as updates",
+                updated_count,
+                len(notices),
+            )
+        else:
+            logger.info("  No matches — all %d properties are new", len(notices))
+        update_registry(registry, notices)
+        save_registry(registry)
+    except Exception as e:
+        logger.warning("  Property registry reconciliation failed: %s", e)
 
     # ── Step 9b: Data Validation ────────────────────────────────────
     logger.info("── Step 9b: Data Validation ──")

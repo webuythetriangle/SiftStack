@@ -1,8 +1,10 @@
 """Entry point for SiftStack — full-stack REI operations platform.
 
 Runs as either:
-  - Apify Actor (when APIFY_IS_AT_HOME is set — reads input from Actor.get_input())
-  - Standalone CLI (python src/main.py daily --counties Knox --types foreclosure)
+  - Apify Actor (when APIFY_IS_AT_HOME is set — reads input from Actor.get_input());
+    this is the only remaining TN (tnpublicnotice.com) path — see actor_main().
+  - Standalone CLI (python src/main.py nc-daily --counties Wake --types foreclosure).
+    TN CLI scrape modes ("daily"/"historical") have been removed — NC-only via CLI.
 """
 
 import argparse
@@ -61,7 +63,11 @@ def _preflight_check(mode: str) -> list[str]:
     # ── Credential checks (mode-dependent) ──────────────────────────
     scrape_modes = {"daily", "historical"}
     nc_scrape_modes = {"nc-daily", "nc-historical"}
-    enrichment_modes = scrape_modes | nc_scrape_modes | {"pdf-import", "photo-import", "dropbox-watch", "csv-import"}
+    ecourts_scrape_modes = {"ecourts-daily", "ecourts-historical"}
+    enrichment_modes = (
+        scrape_modes | nc_scrape_modes | ecourts_scrape_modes
+        | {"pdf-import", "photo-import", "dropbox-watch", "csv-import"}
+    )
     datasift_modes = {"manage-presets", "manage-sold", "phone-validate"}
 
     if mode in scrape_modes:
@@ -73,6 +79,10 @@ def _preflight_check(mode: str) -> list[str]:
     if mode in nc_scrape_modes:
         if not config.CAPTCHA_API_KEY:
             failures.append("CAPTCHA_API_KEY not set (Turnstile solving on ncnotices.com will fail)")
+
+    if mode in ecourts_scrape_modes:
+        if not config.SCRAPFLY_API_KEY:
+            failures.append("SCRAPFLY_API_KEY not set (required — eCourts Portal's AWS WAF has no 2Captcha path)")
 
     if mode in enrichment_modes:
         # These are warnings, not blockers — pipeline degrades gracefully
@@ -113,6 +123,15 @@ def _preflight_check(mode: str) -> list[str]:
                 failures.append(f"ncnotices.com returned {resp.status_code} — site may be down")
         except Exception as e:
             failures.append(f"Cannot reach ncnotices.com: {e}")
+
+    if mode in ecourts_scrape_modes:
+        import requests as _requests
+        try:
+            resp = _requests.head(config.ECOURTS_BASE_URL, timeout=10, allow_redirects=True)
+            if resp.status_code >= 500:
+                failures.append(f"eCourts Portal returned {resp.status_code} — site may be down")
+        except Exception as e:
+            failures.append(f"Cannot reach eCourts Portal: {e}")
 
     # ── 2Captcha balance check ──────────────────────────────────────
     if mode in (scrape_modes | nc_scrape_modes) and config.CAPTCHA_API_KEY:
@@ -1033,7 +1052,8 @@ def cli_main() -> None:
     parser.add_argument(
         "mode",
         choices=[
-            "daily", "historical", "nc-daily", "nc-historical",
+            "nc-daily", "nc-historical",
+            "ecourts-daily", "ecourts-historical",
             "pdf-import", "photo-import", "dropbox-watch",
             "csv-import", "phone-validate", "manage-sold", "manage-presets",
             # New analysis & workflow modes
@@ -1042,7 +1062,10 @@ def cli_main() -> None:
             "playbook",
         ],
         help=(
-            "daily/historical = scrape notices; pdf-import/photo-import = import from files; "
+            # TN (tnpublicnotice.com) CLI scrape modes removed — NC-only via CLI now.
+            "nc-daily/nc-historical = NC published notices; "
+            "ecourts-daily/ecourts-historical = NC eCourts Special Proceedings foreclosure filings; "
+            "pdf-import/photo-import = import from files; "
             "dropbox-watch = poll Dropbox; csv-import = re-enrich CSV; "
             "phone-validate = Trestle scoring; manage-sold/manage-presets = DataSift ops; "
             "comp = comparable sales ARV; rehab = rehab cost estimate; "
@@ -1056,7 +1079,7 @@ def cli_main() -> None:
         "--counties",
         type=str,
         default=None,
-        help='Comma-separated counties to scrape (e.g. "Knox,Blount" or "all")',
+        help='Comma-separated counties to scrape (e.g. "Wake,Durham" or "all")',
     )
     parser.add_argument(
         "--types",
@@ -1713,221 +1736,15 @@ def cli_main() -> None:
         _run_nc_scrape_pipeline(args)
         return
 
-    # Filter saved searches
-    counties = None
-    if args.counties and args.counties.lower() != "all":
-        counties = [c.strip() for c in args.counties.split(",")]
+    # NC eCourts Portal (Special Proceedings foreclosures) — separate pipeline
+    if args.mode in ("ecourts-daily", "ecourts-historical"):
+        _run_ecourts_scrape_pipeline(args)
+        return
 
-    types = None
-    if args.types and args.types.lower() != "all":
-        types = [t.strip() for t in args.types.split(",")]
-
-    searches = _filter_searches(counties, types)
-    if not searches:
-        logging.error("No saved searches match the given --counties / --types filters")
-        sys.exit(1)
-
-    logging.info(
-        "Running %d saved searches: %s",
-        len(searches),
-        ", ".join(s.saved_search_name for s in searches),
-    )
-
-    try:
-        _run_scrape_pipeline(args, searches)
-    except Exception as e:
-        logging.exception("Pipeline failed with unhandled error")
-        try:
-            from slack_notifier import notify_error
-            notify_error("Pipeline (top-level)", e, context=f"mode={args.mode}")
-        except Exception:
-            pass
-        sys.exit(1)
-
-
-def _run_scrape_pipeline(args, searches) -> None:
-    """Run the daily/historical scrape → enrich → export → upload pipeline."""
-    # Scrape
-    notices = asyncio.run(scrape_all(
-        mode=args.mode, searches=searches,
-        llm_api_key=config.ANTHROPIC_API_KEY or None,
-        since_date_override=args.since,
-        max_notices=args.max_notices,
-    ))
-    # Handle async probate lookup before pipeline (requires asyncio.run)
-    probate_notices = [n for n in notices if n.notice_type == "probate" and n.decedent_name and not n.address]
-    if probate_notices:
-        try:
-            from property_lookup import lookup_decedent_properties
-            logging.info("Looking up property addresses for %d probate notices...", len(probate_notices))
-            asyncio.run(lookup_decedent_properties(probate_notices))
-        except ImportError:
-            logging.warning("property_lookup module not found -- skipping property lookup")
-        except Exception as e:
-            logging.warning("Property lookup failed: %s -- continuing without lookups", e)
-
-    # Run unified enrichment pipeline
-    from enrichment_pipeline import PipelineOptions, run_enrichment_pipeline
-
-    opts = PipelineOptions(
-        skip_parcel_lookup=True,  # web scrape notices don't have parcel IDs
-        skip_vacant_filter=getattr(args, "include_vacant", False),
-        skip_commercial_filter=getattr(args, "include_commercial", False),
-        skip_entity_filter=getattr(args, "include_entities", False),
-        skip_smarty=getattr(args, "skip_smarty", False),
-        skip_zillow=getattr(args, "skip_zillow", False),
-        skip_tax=getattr(args, "skip_tax", False),
-        skip_geocode=getattr(args, "skip_geocode", False),
-        skip_obituary=args.skip_obituary,
-        skip_ancestry=getattr(args, "skip_ancestry", False),
-        skip_entity_research=not getattr(args, "research_entities", False),
-        skip_narrpr=getattr(args, "no_narrpr", False),
-        skip_heir_verification=args.skip_heir_verification,
-        max_heir_depth=args.max_heir_depth,
-        skip_dm_address=args.skip_dm_address,
-        tracerfy_tier1=getattr(args, "tracerfy_tier1", False),
-        source_label=f"CLI {args.mode}",
-    )
-    notices = run_enrichment_pipeline(notices, opts)
-
-    if not notices:
-        logging.warning("No notices found")
-        # Send Slack ping even on empty runs so operators know the job
-        # ran successfully (vs silently dying). Previously sys.exit(0)
-        # fired before the Slack block at the bottom of this function.
-        if getattr(args, "notify_slack", False):
-            try:
-                from slack_notifier import send_slack_notification
-                send_slack_notification([])
-            except Exception:
-                logging.exception("Slack notification for empty run failed")
-        sys.exit(0)
-
-    # Tracerfy batch skip trace (phones + emails for all records)
-    tiers_map: dict = {}
-    tracerfy_stats: dict = {}
-    if not getattr(args, "skip_tracerfy", False):
-        import config as cfg
-        if cfg.TRACERFY_API_KEY:
-            from tracerfy_skip_tracer import batch_skip_trace
-            tracerfy_stats = batch_skip_trace(notices)
-            if tracerfy_stats.get("credits_exhausted"):
-                logging.error(
-                    "TRACERFY OUT OF CREDITS — skip trace disabled for this run. "
-                    "Add credits at https://tracerfy.com/billing to resume phone/email lookups."
-                )
-            logging.info(
-                "Tracerfy: %d/%d matched, %d phones, %d emails, $%.2f",
-                tracerfy_stats.get("matched", 0), tracerfy_stats.get("submitted", 0),
-                tracerfy_stats.get("phones_found", 0), tracerfy_stats.get("emails_found", 0),
-                tracerfy_stats.get("cost", 0.0),
-            )
-            # Score every phone (DM #1 + all heirs) — writes per-heir phone_scores
-            # into heir_map_json so DataSift Notes and PDFs can surface tier badges.
-            if cfg.TRESTLE_API_KEY:
-                from phone_validator import score_record_phones
-                dp_cands = [
-                    n for n in notices
-                    if n.owner_deceased == "yes" or n.heir_map_json or n.decision_maker_name
-                ]
-                if dp_cands:
-                    try:
-                        tiers_map = score_record_phones(dp_cands, cfg.TRESTLE_API_KEY)
-                        logging.info("Trestle scored %d unique phones across %d DP records",
-                                     len(tiers_map), len(dp_cands))
-                    except Exception as e:
-                        logging.warning("Per-record Trestle scoring failed: %s", e)
-
-    # Write output
-    if args.split:
-        paths = write_csv_by_type(notices)
-        for p in paths:
-            logging.info("Output: %s", p)
-    else:
-        path = write_csv(notices)
-        logging.info("Output: %s", path)
-
-    # Generate deep-prospecting PDFs for deceased/DM/heir records.
-    # Matches the Apify branch behavior so CLI runs get the same reports —
-    # includes the Case Summary section added for deceased-owner records.
-    dp_candidates = [
-        n for n in notices
-        if n.owner_deceased == "yes" or n.heir_map_json or n.decision_maker_name
-    ]
-    if dp_candidates:
-        try:
-            from report_generator import generate_record_pdf
-            report_dir = Path("output/reports")
-            generated = 0
-            for n in dp_candidates:
-                try:
-                    pdf_path = generate_record_pdf(
-                        n, output_dir=report_dir, phone_tiers=tiers_map,
-                    )
-                    logging.info("Report generated: %s", pdf_path)
-                    generated += 1
-                except Exception:
-                    logging.exception("PDF generation failed for %s", n.address)
-            logging.info(
-                "Generated %d/%d deep-prospecting PDFs in %s",
-                generated, len(dp_candidates), report_dir,
-            )
-        except Exception:
-            logging.exception("Report generator import failed")
-
-    # DataSift upload
-    upload_result = None
-    if getattr(args, "upload_datasift", False):
-        from datasift_formatter import write_datasift_csv, write_datasift_split_csvs
-        from datasift_uploader import upload_to_datasift, upload_datasift_split
-
-        do_enrich = not getattr(args, "no_enrich", False)
-        do_skip_trace = not getattr(args, "no_skip_trace", False)
-
-        # Use split flow (separate DM + Heir Map Message Board entries)
-        csv_infos = write_datasift_split_csvs(notices)
-        for info in csv_infos:
-            logging.info("DataSift CSV (%s): %s", info["label"], info["path"])
-
-        if len(csv_infos) > 1:
-            upload_result = asyncio.run(
-                upload_datasift_split(
-                    csv_infos,
-                    enrich=do_enrich,
-                    skip_trace=do_skip_trace,
-                )
-            )
-        else:
-            # No deceased-with-heirs — single CSV upload
-            upload_result = asyncio.run(
-                upload_to_datasift(
-                    csv_infos[0]["path"],
-                    enrich=do_enrich,
-                    skip_trace=do_skip_trace,
-                )
-            )
-
-        if upload_result.get("success"):
-            logging.info("DataSift upload: %s", upload_result.get("message", "OK"))
-            if upload_result.get("enrich_result"):
-                logging.info("  Enrich: %s", upload_result["enrich_result"].get("message", ""))
-            if upload_result.get("skip_trace_result"):
-                logging.info("  Skip trace: %s", upload_result["skip_trace_result"].get("message", ""))
-        else:
-            logging.error("DataSift upload failed: %s", upload_result.get("message"))
-
-    # Slack/Discord notification
-    if getattr(args, "notify_slack", False):
-        from slack_notifier import send_slack_notification
-
-        send_slack_notification(notices, upload_result=upload_result)
-
-    # Audit DataSift for incomplete records (future daily check)
-    if getattr(args, "audit_records", False):
-        logging.info("--audit-records: Not yet implemented. "
-                      "Will check DataSift Incomplete tab via Playwright in a future build.")
-
-    logging.info("Done — %d notices exported", len(notices))
+    # No mode reaches here — every choice above returns. TN (tnpublicnotice.com)
+    # CLI scrape modes ("daily"/"historical") were removed; scrape_all() and
+    # SAVED_SEARCHES are still used by actor_main() (Apify Actor mode), which
+    # is intentionally untouched.
 
 
 def _filter_nc_searches(counties: list[str] | None, types: list[str] | None):
@@ -2078,6 +1895,89 @@ def _run_nc_scrape_pipeline(args) -> None:
         send_slack_notification(notices, upload_result=upload_result)
 
     logging.info("Done — %d NC notices exported", len(notices))
+
+
+def _run_ecourts_scrape_pipeline(args) -> None:
+    """Run the NC eCourts Portal (Special Proceedings foreclosures) scrape ->
+    light enrichment -> export pipeline.
+
+    Same lean enrichment profile as _run_nc_scrape_pipeline (skips TN-specific
+    parcel/tax/obituary/ancestry enrichers). Deliberately shares
+    property_registry's address+zip+notice_type+county merge key with
+    ncnotices.com's foreclosure notices — an eCourts hit today and that same
+    property's later published sale notice collapse into one lead instead of
+    two, with the newer notice's fields winning and the earlier one's
+    enrichment preserved (see property_registry.merge_notice_data).
+    """
+    from ecourts_scraper import scrape_all_ecourts
+
+    counties = None
+    if args.counties and args.counties.lower() != "all":
+        counties = [c.strip() for c in args.counties.split(",")]
+        unknown = [c for c in counties if c.lower() not in {t.lower() for t in config.ECOURTS_TARGET_COUNTIES}]
+        if unknown:
+            logging.error("Unknown eCourts county/counties: %s (targets: %s)", ", ".join(unknown), ", ".join(config.ECOURTS_TARGET_COUNTIES))
+            sys.exit(1)
+
+    days_back = None
+    if args.since:
+        try:
+            since_dt = datetime.strptime(args.since, "%Y-%m-%d")
+            days_back = max(1, (datetime.now() - since_dt).days)
+        except ValueError:
+            logging.error("--since must be YYYY-MM-DD")
+            sys.exit(1)
+    elif args.mode == "ecourts-historical":
+        days_back = 365
+    else:
+        days_back = 7
+
+    mode = "historical" if args.mode == "ecourts-historical" else "daily"
+
+    # Cross-run dedup — mirrors nc_seen_ids, keyed by case number instead of a
+    # URL-embedded numeric ID (eCourts case detail URLs don't have one).
+    ecourts_seen_ids = config.load_state(config.ECOURTS_SEEN_IDS_FILE)
+    cutoff = (datetime.now() - timedelta(days=config.SEEN_IDS_PRUNE_DAYS)).strftime("%Y-%m-%d")
+    ecourts_seen_ids = {cid: d for cid, d in ecourts_seen_ids.items() if d >= cutoff}
+
+    notices = asyncio.run(scrape_all_ecourts(
+        mode=mode, counties=counties, days_back=days_back,
+        max_notices=args.max_notices, seen_case_numbers=ecourts_seen_ids,
+    ))
+    config.save_state(config.ECOURTS_SEEN_IDS_FILE, ecourts_seen_ids)
+
+    from enrichment_pipeline import PipelineOptions, run_enrichment_pipeline
+
+    opts = PipelineOptions(
+        skip_parcel_lookup=True,
+        skip_tax=True,
+        skip_zillow=getattr(args, "skip_zillow", False),
+        skip_smarty=getattr(args, "skip_smarty", False),
+        skip_geocode=getattr(args, "skip_geocode", False),
+        skip_obituary=True,
+        skip_ancestry=True,
+        skip_narrpr=getattr(args, "no_narrpr", False),
+        skip_vacant_filter=getattr(args, "include_vacant", False),
+        skip_commercial_filter=getattr(args, "include_commercial", False),
+        skip_entity_filter=getattr(args, "include_entities", False),
+        source_label=f"eCourts CLI {args.mode}",
+    )
+    notices = run_enrichment_pipeline(notices, opts)
+
+    if not notices:
+        logging.warning("No eCourts notices found")
+        sys.exit(0)
+
+    if args.split:
+        paths = write_csv_by_type(notices)
+        for p in paths:
+            logging.info("Output: %s", p)
+    else:
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+        path = write_csv(notices, filename=f"ecourts_notices_{timestamp}.csv")
+        logging.info("Output: %s", path)
+
+    logging.info("Done — %d eCourts notices exported", len(notices))
 
 
 # ── Entry point ───────────────────────────────────────────────────────

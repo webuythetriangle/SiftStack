@@ -55,29 +55,10 @@ jobs:
           restore-keys: |
             siftstack-state-
 
-      # TN (tnpublicnotice.com) daily scrape — temporarily disabled.
-      # - name: Run TN daily scrape
-      #   id: tn_daily
-      #   env:
-      #     TNPN_EMAIL: ${{ secrets.TNPN_EMAIL }}
-      #     TNPN_PASSWORD: ${{ secrets.TNPN_PASSWORD }}
-      #     CAPTCHA_API_KEY: ${{ secrets.CAPTCHA_API_KEY }}
-      #     DATASIFT_EMAIL: ${{ secrets.DATASIFT_EMAIL }}
-      #     DATASIFT_PASSWORD: ${{ secrets.DATASIFT_PASSWORD }}
-      #     SMARTY_AUTH_ID: ${{ secrets.SMARTY_AUTH_ID }}
-      #     SMARTY_AUTH_TOKEN: ${{ secrets.SMARTY_AUTH_TOKEN }}
-      #     OPENWEBNINJA_API_KEY: ${{ secrets.OPENWEBNINJA_API_KEY }}
-      #     ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-      #     SERPER_API_KEY: ${{ secrets.SERPER_API_KEY }}
-      #     FIRECRAWL_API_KEY: ${{ secrets.FIRECRAWL_API_KEY }}
-      #     TRACERFY_API_KEY: ${{ secrets.TRACERFY_API_KEY }}
-      #     TRESTLE_API_KEY: ${{ secrets.TRESTLE_API_KEY }}
-      #     SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-      #     NARRPR_EMAIL: ${{ secrets.NARRPR_EMAIL }}
-      #     NARRPR_PASSWORD: ${{ secrets.NARRPR_PASSWORD }}
-      #     ANCESTRY_EMAIL: ${{ secrets.ANCESTRY_EMAIL }}
-      #     ANCESTRY_PASSWORD: ${{ secrets.ANCESTRY_PASSWORD }}
-      #   run: python src/main.py daily --upload-datasift --notify-slack
+      # TN (tnpublicnotice.com) daily scrape removed from this workflow — the
+      # "daily"/"historical" CLI modes it called no longer exist (NC-only via
+      # CLI now; TN survives only through the separate Apify Actor deployment,
+      # see CLAUDE.md "Apify Deployment" / actor_main() in src/main.py).
 
       - name: Run NC daily scrape
         id: nc_daily

@@ -325,6 +325,8 @@ def _research_single_entity(
     state = notice.state or "Tennessee"
     if state == "TN":
         state = "Tennessee"
+    elif state == "NC":
+        state = "North Carolina"
 
     search_results = _search_entity(name, state)
     if not search_results:

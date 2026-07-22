@@ -7,6 +7,8 @@ input_foreclosure_daily.json
 last_run.json
 seen_ids.json
 nc_seen_ids.json
+ecourts_seen_ids.json
+seen_properties.json
 captcha_failed_ids.json
 .ancestry_page_loads.json
 cookies.json
@@ -20,6 +22,7 @@ photo_state.json
 # Output (generated data)
 output/
 logs/
+nc_tax_cache/
 
 # Python
 __pycache__/

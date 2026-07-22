@@ -89,6 +89,12 @@ DATASIFT_COLUMNS = [
     "DM 3 Relationship",
     "Obituary URL",
     "Source URL",
+    # ── NARRPR (RPR) RVM valuation — second AVM, cross-checked against Estimated Value ──
+    "RVM Value",
+    "RVM Value Low",
+    "RVM Value High",
+    "RVM Confidence",
+    "RVM Updated Date",
     # ── Deep prospecting fields ──
     "DM 1 Status",
     "DM 1 Source",
@@ -330,6 +336,12 @@ def _build_tags(notice: NoticeData) -> str:
     # Photo import tag (source_url starts with "photo:")
     if notice.source_url and notice.source_url.startswith("photo:"):
         tags.append("photo_import")
+
+    # eCourts Special Proceedings filing — arrives before the sale notice is
+    # published (see ecourts_scraper.py), worth distinguishing from the later
+    # ncnotices.com publication it may eventually merge with via property_registry.
+    if notice.source_url and "tylertech.cloud" in notice.source_url:
+        tags.append("ecourts_pre_publication")
 
     return ",".join(tags)
 
@@ -765,6 +777,12 @@ def _build_row(notice: NoticeData, notes_override: str | None = None) -> dict:
         "DM 3 Relationship": notice.decision_maker_3_relationship,
         "Obituary URL": notice.obituary_url,
         "Source URL": notice.source_url,
+        # ── NARRPR (RPR) RVM valuation ──
+        "RVM Value": notice.rvm_value,
+        "RVM Value Low": notice.rvm_value_low,
+        "RVM Value High": notice.rvm_value_high,
+        "RVM Confidence": notice.rvm_confidence,
+        "RVM Updated Date": _format_date(notice.rvm_updated_date),
         # ── Deep prospecting fields ──
         "DM 1 Status": notice.decision_maker_status,
         "DM 1 Source": notice.decision_maker_source,

@@ -52,6 +52,12 @@ SIFT_COLUMNS = [
     "sqft",
     "year_built",
     "lot_size",
+    # NARRPR (RPR) RVM valuation fields — second AVM, cross-checked against Zestimate
+    "rvm_value",
+    "rvm_value_low",
+    "rvm_value_high",
+    "rvm_confidence",
+    "rvm_updated_date",
     # County assessor / tax fields
     "parcel_id",
     "tax_delinquent_amount",
@@ -140,54 +146,82 @@ def _notice_id_from_url(url: str) -> str:
 
 
 def deduplicate(notices: list[NoticeData]) -> list[NoticeData]:
-    """Remove duplicate notices by notice ID (from source URL).
+    """Remove exact duplicate notices, then merge same-property notices.
 
-    The same notice can appear in multiple saved searches (e.g., a foreclosure
-    notice may match both "foreclosure" and "tax_sale" keyword searches).
-    We keep the first occurrence of each notice ID.
+    Pass 1 — exact-duplicate removal by notice ID (from source URL), falling
+    back to parcel_id: the same notice can appear in multiple saved searches
+    (e.g. matches both "foreclosure" and "tax_sale" keyword searches). Keeps
+    the first occurrence.
 
-    Falls back to address-based dedup if no notice ID is available.
+    Pass 2 — same-property merge: a notice source can re-publish an amended/
+    postponed notice under a brand-new ID for a property already seen earlier
+    in this same batch (e.g. original + amended foreclosure sale notice both
+    inside the lookback window). Pass 1 can't catch this since the IDs
+    differ. Grouping by property_key() (address+zip+notice_type+county) and
+    merging via merge_notice_data() collapses these into one record instead
+    of two, keeping whichever fields either notice has (newer non-empty
+    fields win) instead of discarding one notice's data wholesale.
     """
+    from property_registry import merge_notice_data, property_key
+
+    # Pass 1: exact-duplicate removal by notice ID / parcel ID
     seen_ids: set[str] = set()
     seen_parcels: set[str] = set()
-    seen_addrs: dict[str, NoticeData] = {}
-    result: list[NoticeData] = []
-
+    pass1: list[NoticeData] = []
     for notice in notices:
-        # Primary dedup: by notice ID from URL
         nid = _notice_id_from_url(notice.source_url)
         if nid:
             if nid in seen_ids:
                 continue
             seen_ids.add(nid)
-            result.append(notice)
+            pass1.append(notice)
             continue
 
-        # Secondary dedup: by parcel_id (for PDF imports)
         pid = notice.parcel_id.strip()
         if pid:
             if pid in seen_parcels:
                 continue
             seen_parcels.add(pid)
-            result.append(notice)
+            pass1.append(notice)
             continue
 
-        # Tertiary: by address (for notices without ID or parcel)
+        pass1.append(notice)
+
+    # Pass 2: merge notices referencing the same property
+    by_property: dict[str, NoticeData] = {}
+    order: list[str] = []
+    no_addr_count = 0
+    for notice in pass1:
         key = notice.address.strip().lower()
         if not key:
-            result.append(notice)
+            # No address to key on — can't merge, keep as its own entry.
+            no_addr_count += 1
+            unique_key = f"__noaddr__{no_addr_count}"
+            by_property[unique_key] = notice
+            order.append(unique_key)
             continue
 
-        existing = seen_addrs.get(key)
-        if existing is None or notice.date_added > existing.date_added:
-            seen_addrs[key] = notice
+        key = property_key(notice)
+        existing = by_property.get(key)
+        if existing is None:
+            by_property[key] = notice
+            order.append(key)
+        else:
+            newer, older = (
+                (notice, existing)
+                if notice.date_added >= existing.date_added
+                else (existing, notice)
+            )
+            by_property[key] = merge_notice_data(base=older, overlay=newer)
 
-    # Add address-deduped notices
-    result.extend(seen_addrs.values())
+    result = [by_property[k] for k in order]
 
     removed = len(notices) - len(result)
     if removed:
-        logger.info("Deduplicated: removed %d duplicate notices", removed)
+        logger.info(
+            "Deduplicated: removed %d duplicate/re-published notices (merged into existing leads)",
+            removed,
+        )
     return result
 
 
@@ -250,6 +284,11 @@ def write_csv(notices: list[NoticeData], filename: str | None = None) -> Path:
                 "sqft": notice.sqft,
                 "year_built": notice.year_built,
                 "lot_size": notice.lot_size,
+                "rvm_value": notice.rvm_value,
+                "rvm_value_low": notice.rvm_value_low,
+                "rvm_value_high": notice.rvm_value_high,
+                "rvm_confidence": notice.rvm_confidence,
+                "rvm_updated_date": _format_date_sift(notice.rvm_updated_date),
                 "parcel_id": notice.parcel_id,
                 "tax_delinquent_amount": notice.tax_delinquent_amount,
                 "tax_delinquent_years": notice.tax_delinquent_years,

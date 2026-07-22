@@ -17,7 +17,15 @@ LOG_DIR = PROJECT_ROOT / "logs"
 STATE_FILE = PROJECT_ROOT / "last_run.json"
 SEEN_IDS_FILE = PROJECT_ROOT / "seen_ids.json"
 NC_SEEN_IDS_FILE = PROJECT_ROOT / "nc_seen_ids.json"
+ECOURTS_SEEN_IDS_FILE = PROJECT_ROOT / "ecourts_seen_ids.json"  # keyed by case number (e.g. "26SP123"), not URL
 SEEN_IDS_PRUNE_DAYS = 90
+# Cross-run property-level lead registry (see property_registry.py). Keyed by
+# address+zip+notice_type+county so a re-published/amended notice for a
+# property already scraped gets merged into the existing lead instead of
+# appearing as a second row. Longer prune window than seen_ids since
+# foreclosure/tax-sale/probate processes can span months between notices.
+SEEN_PROPERTIES_FILE = PROJECT_ROOT / "seen_properties.json"
+SEEN_PROPERTIES_PRUNE_DAYS = 180
 # Notices that exhausted all CAPTCHA retries during scraping.
 # Persisted so the next run's summary can surface them instead of
 # silently dropping — and a future retry pass can prioritize them.
@@ -26,6 +34,10 @@ CAPTCHA_FAILED_PRUNE_DAYS = 14
 COOKIES_FILE = PROJECT_ROOT / "cookies.json"
 DROPBOX_STATE_FILE = PROJECT_ROOT / "dropbox_state.json"
 PHOTO_STATE_FILE = PROJECT_ROOT / "photo_state.json"
+# Downloaded county bulk tax files (Wake daily XLSX, Orange annual XLSX) —
+# cached to disk so a run doesn't re-download an unchanged file. See
+# nc_tax_enricher.py.
+NC_TAX_CACHE_DIR = PROJECT_ROOT / "nc_tax_cache"
 
 # ── Dropbox Watcher ────────────────────────────────────────────────────
 DROPBOX_POLL_INTERVAL = int(os.getenv("DROPBOX_POLL_INTERVAL", "900"))  # seconds (default 15 min)
@@ -34,11 +46,17 @@ DROPBOX_STORAGE_WARN_PERCENT = 80  # warn when storage usage exceeds this %
 
 OUTPUT_DIR.mkdir(exist_ok=True)
 LOG_DIR.mkdir(exist_ok=True)
+NC_TAX_CACHE_DIR.mkdir(exist_ok=True)
 
 # ── Credentials ────────────────────────────────────────────────────────
 TNPN_EMAIL = os.getenv("TNPN_EMAIL", "")
 TNPN_PASSWORD = os.getenv("TNPN_PASSWORD", "")
 CAPTCHA_API_KEY = os.getenv("CAPTCHA_API_KEY", "")  # 2Captcha API key
+SCRAPFLY_API_KEY = os.getenv("SCRAPFLY_API_KEY", "")  # Scrapfly anti-bot scraping API (see scrapfly_solver.py — not wired in by default)
+SCRAPFLY_PROXY_POOL = os.getenv("SCRAPFLY_PROXY_POOL", "public_residential_pool")
+# Tags attached to every Scrapfly request for dashboard-side filtering/analytics
+# (Scrapfly's "Monitoring" tab groups usage/cost by tag). Comma-separated env override.
+SCRAPFLY_TAGS = [t.strip() for t in os.getenv("SCRAPFLY_TAGS", "siftstack,ecourts-scraper").split(",") if t.strip()]
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")  # Claude Haiku for LLM parsing
 SMARTY_AUTH_ID = os.getenv("SMARTY_AUTH_ID", "")        # Smarty address standardization
 SMARTY_AUTH_TOKEN = os.getenv("SMARTY_AUTH_TOKEN", "")
@@ -178,6 +196,34 @@ NC_SAVED_SEARCHES: list[NCSearch] = [
     NCSearch("Orange", "foreclosure", "foreclosure"),
     NCSearch("Guilford", "foreclosure", "foreclosure"),
     NCSearch("Mecklenburg", "foreclosure", "foreclosure"),
+]
+
+# ── NC eCourts Portal (Tyler Technologies Odyssey — statewide, all 100 NC
+# counties as of the Oct 13, 2025 full rollout) ─────────────────────────
+# A power-of-sale foreclosure under a deed of trust is filed as a Special
+# Proceeding (NCGS Chapter 45, Article 2A) with the Clerk of Superior Court —
+# the trustee/substitute trustee files a "Notice of Hearing" here BEFORE any
+# sale notice is published in the newspaper (ncnotices_scraper.py's source,
+# which only sees the case weeks later at publication). Catching the SP
+# filing/Notice of Hearing at eCourts is materially first-to-market.
+#
+# Confirmed live (2026-07-19): redirects from the legacy
+# www3.nccourts.org/onlineservices/menu.sp URL. Protected by AWS WAF Bot
+# Control with a CAPTCHA "Human Verification" interstitial — NOT Google
+# reCAPTCHA (tnpublicnotice.com) or Cloudflare Turnstile (ncnotices.com).
+# 2Captcha has no turnkey AWS WAF token type, which is why this source uses
+# Scrapfly's ASP (anti-scraping-protection) bypass instead — see
+# ecourts_scraper.py. Scrapfly's ASP shield did not clear on the first
+# live attempt against this portal (ERR::ASP::SHIELD_PROTECTION_FAILED) —
+# per Scrapfly's own docs this is expected and warrants retrying; treat
+# occasional shield failures as a retryable condition, not a hard failure.
+ECOURTS_BASE_URL = "https://portal-nc.tylertech.cloud/Portal"
+ECOURTS_SMART_SEARCH_URL = f"{ECOURTS_BASE_URL}/Home/Dashboard/29"
+ECOURTS_CASE_CATEGORY = "Special Proceedings"
+
+# Same 5-county NC expansion market as NC_SAVED_SEARCHES (ncnotices_scraper.py).
+ECOURTS_TARGET_COUNTIES: list[str] = [
+    "Wake", "Durham", "Orange", "Guilford", "Mecklenburg",
 ]
 
 # ── Entity Detection ──────────────────────────────────────────────────

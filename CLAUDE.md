@@ -6,15 +6,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **SiftStack** — Full-stack real estate investing operations platform built around DataSift.ai CRM. Covers the entire REI business lifecycle:
 
-1. **Data Acquisition:** Web scraping tnpublicnotice.com (foreclosures, tax sales, probates), scanned PDF import, courthouse terminal photo import (probate, eviction, code violations, divorce), Dropbox auto-polling
-2. **Enrichment Pipeline:** 10+ steps — Smarty address standardization, Zillow property data, Knox County Tax API, obituary/heir research, Ancestry.com SSDI, Tracerfy skip trace, Trestle phone scoring, entity research
+1. **Data Acquisition:** Web scraping (NC-only via CLI — see below), scanned PDF import, courthouse terminal photo import (probate, eviction, code violations, divorce), Dropbox auto-polling
+2. **Enrichment Pipeline:** 10+ steps — Smarty address standardization, Zillow property data, NC county tax delinquency APIs, obituary/heir research, Ancestry.com SSDI, Tracerfy skip trace, Trestle phone scoring, entity research
 3. **Deal Analysis:** Comparable sales (Two-Bucket ARV), rehab estimation (4-tier room-by-room), deal analyzer (MAO/ROI/financing scenarios)
 4. **Market Intelligence:** Zip code scoring, Market Finder reports, cash buyer list building, investor portfolio analysis
 5. **CRM Automation:** DataSift upload, 26 TCA sequence templates, 12 niche sequential marketing presets, filter preset management, SiftMap sold property tagging
 6. **Lead Management:** 4 Pillars of Motivation auto-qualification, STABM daily routine, pipeline reporting, deep prospecting (4-level framework)
 7. **Operations:** Acquisition playbook generator (SOPs, scripts, checklists), Slack/Discord notifications, Google Drive upload, Apify Actor deployment
 
-Currently focused on Knox and Blount counties, Tennessee.
+Active market is NC (Wake, Durham, Orange, Guilford, Mecklenburg counties) via the CLI (`nc-daily`/`nc-historical`, `ecourts-daily`/`ecourts-historical`) and GitHub Actions (`daily.yml`). **TN (Knox/Blount, tnpublicnotice.com) CLI scrape modes and Knox-specific enrichment (parcel/probate/tax lookups) were removed** (see "TN Scrape Removal" below) — TN survives only in the separate Apify Actor deployment (`actor_main()` in `src/main.py`), which was deliberately left untouched and still uses `scraper.py`/`tax_enricher.py`/`config.SAVED_SEARCHES` on its own.
 
 8. **REI Skill Library:** 13 Claude Co-Work skill files (`.skill`/`.plugin` ZIPs) for distribution to DataSift community via [learn.datasift.ai/claude-skills-rei](https://learn.datasift.ai/claude-skills-rei). Skills teach Claude specific REI workflows when uploaded to Co-Work sessions or Projects.
 
@@ -26,13 +26,14 @@ pip install -r requirements.txt
 playwright install chromium
 cp .env.example .env  # then fill in credentials
 
-# Run
-python src/main.py daily                          # new notices since last run
-python src/main.py historical                     # last 12 months of data
-python src/main.py daily --split                  # separate CSV per county+type
-python src/main.py daily --counties Knox          # only Knox county
-python src/main.py daily --types foreclosure,probate  # only specific types
-python src/main.py daily -v                       # verbose/debug logging
+# Run (NC — TN CLI modes removed, see "TN Scrape Removal")
+python src/main.py nc-daily                          # new NC notices since last run
+python src/main.py nc-historical                     # last 12 months of NC data
+python src/main.py nc-daily --split                  # separate CSV per county+type
+python src/main.py nc-daily --counties Wake          # only Wake county
+python src/main.py nc-daily --types foreclosure       # only specific types
+python src/main.py nc-daily -v                       # verbose/debug logging
+python src/main.py ecourts-daily                      # NC eCourts Special Proceedings foreclosures
 
 # DataSift preset/sequence management
 python src/main.py manage-presets --discover                      # list all presets and sequences
@@ -57,14 +58,15 @@ All source files are in `src/` and imports assume `src/` is the working director
 ## Architecture
 
 **Data flows:**
-- **Web scrape:** `main.py` → `scraper.py` → `captcha_solver.py` → `notice_parser.py` + `foreclosure_filter.py` → enrichment → CSV
+- **Web scrape (TN, Apify Actor only — see "TN Scrape Removal" below):** `main.py actor_main()` → `scraper.py` → `captcha_solver.py` → `notice_parser.py` + `foreclosure_filter.py` → enrichment → Apify dataset
+- **Web scrape (NC, CLI):** `main.py` → `ncnotices_scraper.py` / `ecourts_scraper.py` → `notice_parser.py` → enrichment → CSV
 - **PDF import:** `main.py` → `pdf_importer.py` (pypdfium2 → `image_utils.py` OCR) → enrichment → CSV
 - **Photo import:** `main.py` → `photo_importer.py` (OpenCV → `image_utils.py` OCR → `llm_parser.py`) → enrichment → CSV
 - **Dropbox watch:** `dropbox_watcher.py` → `photo_importer.py` → enrichment → CSV (auto-polling loop)
 - **Market Finder:** `extract_market_finder.py` → DataSift Market Finder (Playwright) → paginate all ZIP + neighborhood data → JSON → `generate_knox_report.py` → 7-sheet Excel
 
-- **main.py** — CLI entry point. Parses args (`daily`/`historical`, `--split`, `--counties`, `--types`, `-v`). Filters saved searches by county/type, orchestrates scrape → dedup → export, logs run summary stats.
-- **scraper.py** — Playwright browser automation. Reuses saved session cookies when possible, falls back to fresh login. Selects each saved search from the Smart Search dropdown (triggers ASP.NET postback), paginates results (50/page max), clicks each View button to open notice detail pages. Uses `last_run.json` for daily mode state, `cookies.json` for session persistence.
+- **main.py** — CLI entry point. Parses args (`nc-daily`/`nc-historical`/`ecourts-daily`/`ecourts-historical`, `--split`, `--counties`, `--types`, `-v`). Filters saved searches by county/type, orchestrates scrape → dedup → export, logs run summary stats. Also contains `actor_main()`, a separate TN-only entry point used exclusively by the Apify Actor deployment — see "TN Scrape Removal" below.
+- **scraper.py** — Playwright browser automation for TN (tnpublicnotice.com), used only by `actor_main()` now. Reuses saved session cookies when possible, falls back to fresh login. Selects each saved search from the Smart Search dropdown (triggers ASP.NET postback), paginates results (50/page max), clicks each View button to open notice detail pages. Uses `last_run.json` for daily mode state, `cookies.json` for session persistence.
 - **captcha_solver.py** — Solves reCAPTCHA v2 via **2Captcha API** on every notice detail page. Sends websiteURL + sitekey, gets back a `g-recaptcha-response` token, injects it, clicks "View Notice". Retries up to 3 times. This is the primary bottleneck (~10-30s per notice).
 - **notice_parser.py** — Extracts structured fields from raw notice text using regex. There are NO structured HTML fields on the site — address, owner, dates are all embedded in free-text notice bodies. Defines the `NoticeData` dataclass used throughout.
 - **foreclosure_filter.py** — Filters foreclosure search results to only keep real first-to-market trustee sales. Matches against observed title variations (substitute/successor trustee sales). Non-foreclosure notice types pass through unfiltered.
@@ -77,6 +79,20 @@ All source files are in `src/` and imports assume `src/` is the working director
 - **extract_market_finder.py** — Playwright automation to extract ALL ZIP code + neighborhood data from DataSift Market Finder. Handles styled-component dropdowns, pagination (20 rows/page), Beamer popup dismissal. Outputs JSON. See "Market Finder Extraction Patterns" below.
 - **market_analyzer.py** — ZIP code scoring engine. 6-factor weighted composite (Distress 30%, Value 20%, Equity 15%, Tax Delinquency 15%, Competition 10%, DOM 10%). Grades A/B/C/D, budget allocation across top ZIPs. Reads from scraped notice CSVs in `output/`.
 - **drive_uploader.py** — Google Drive upload via service account. `upload_file()` (generic, returns webViewLink) and `upload_csv()` (CSV-specific, returns file ID).
+
+## TN Scrape Removal (2026-07-22)
+
+TN (Knox/Blount, tnpublicnotice.com) was the original market this project was built around, but active work has moved to NC. This was a deliberate removal of *call sites*, not a deletion of the underlying implementation — nothing about `scraper.py`, `captcha_solver.py`, `foreclosure_filter.py`, or `tax_enricher.py` was changed; they simply aren't invoked from the CLI or the shared enrichment pipeline anymore.
+
+**Removed:**
+- CLI `daily`/`historical` modes — no longer valid `--mode` choices in `main.py`'s argparse. The ~180-line `_run_scrape_pipeline()` function that backed them (scrape → probate lookup → enrichment → Tracerfy → DataSift upload → Slack) was deleted along with the dispatch code that called it.
+- `enrichment_pipeline.py` Step 3c (Knox-only probate property lookup via `tax_enricher._probate_property_lookup`) and Step 4 (Knox-only parcel address lookup via `tax_enricher.lookup_parcel_addresses`) — both were gated to `county.lower() == "knox"` and had no NC equivalent, so they're gone outright rather than left as dead Knox-only branches.
+- The Knox County call inside Step 5 (`tax_enricher.enrich_tax_delinquency`) — Step 5 is NC-only now (`nc_tax_enricher.enrich_nc_tax_delinquency`, see "NC Tax Delinquency Enrichment").
+- The commented-out `daily.yml` GitHub Actions step (it referenced the now-removed `python src/main.py daily` CLI invocation, so kept it accurate rather than leaving stale dead config).
+
+**Deliberately NOT touched — `actor_main()` (Apify Actor mode):** This is a separate, TN-only entry point (`TNPN_EMAIL`/`TNPN_PASSWORD` credentials, `scraper.scrape_all()`, `config.SAVED_SEARCHES`) used exclusively by the Apify cloud deployment, not by the CLI or `daily.yml`. It was left running as-is since disabling it wouldn't stop a live Apify Console schedule anyway — it would just make scheduled runs start failing with no NC replacement to fall back to. **Known consequence:** because `actor_main()` calls the same shared `run_enrichment_pipeline()`, any future TN scrape through it will no longer get Knox parcel-address-fixing or Knox tax-delinquency enrichment (Steps 3c/4/Knox-5 are gone from the shared pipeline) — scraping, other enrichment steps, and DataSift upload still work, just without those two Knox-specific enrichments. If TN/Apify is ever revived in earnest, that gap needs a conscious decision (re-add a Knox-gated branch, or accept the loss).
+
+**Untouched by design:** `config.SAVED_SEARCHES` (Knox/Blount saved searches — still read by `actor_main()`), `main.py`'s `_filter_searches()` (same reason), `tax_enricher.py` itself (now dead code from the CLI's perspective but still imported by nothing — kept in the repo, not deleted), and the `manage-sold` SiftMap workflow's Knox/Blount default (a separate CRM tagging feature, not the scrape/enrichment pipeline).
 
 ## Site-Specific Details
 
@@ -97,11 +113,53 @@ Filterable via `--counties` and `--types` CLI args (comma-separated, or omit for
 - **Probate owner_name** should be the Personal Representative/Executor/Administrator — not the deceased.
 - **Owner names** in foreclosure notices typically appear after "executed by" in the deed of trust language.
 - **Rate limiting:** 2-3 second random delays between requests, 3 retries per page.
-- **Address dedup:** Same property can appear in multiple notices; `data_formatter.deduplicate()` keeps the most recent.
+- **Address dedup:** Same property can appear in multiple notices (including a re-published/amended notice with a new ID for a property already scraped). `data_formatter.deduplicate()` merges same-property notices field-by-field (newer non-empty fields win, older fields fall back) instead of discarding one wholesale. `property_registry.py` extends this across runs — a persisted `seen_properties.json` (keyed by address+zip+notice_type+county) lets a notice re-published on a later day update the existing lead instead of creating a duplicate. See "Property Registry" below.
 
 ## Output
 
 CSV files land in `output/` (gitignored). Logs go to `logs/` with timestamped filenames. Sift columns: `date_added, address, city, state, zip, owner_name, notice_type, county, source_url`.
+
+## Property Registry (Cross-Run Lead Dedup)
+
+`src/property_registry.py` prevents a re-published/amended notice (postponed foreclosure sale, amended probate filing, etc. — same event, new notice ID) from showing up as a second lead for a property already scraped, whether that happened earlier in the same run or on a prior day.
+
+- **State file:** `seen_properties.json` (repo root, gitignored, persisted across scheduled runs via the same GitHub Actions cache as `seen_ids.json`). Pruned after `SEEN_PROPERTIES_PRUNE_DAYS` (180) days.
+- **Key:** `address + zip + notice_type + county` (normalized, uppercased). Deliberately includes `notice_type` — a probate followed later by a foreclosure on the same address is a distinct event and is NOT merged; only a re-notice of the *same* type merges.
+- **Merge rule (`merge_notice_data`):** field-by-field, the newer notice's non-empty value wins; if it's blank, the previously-known value (e.g. last run's Zillow/NARRPR/decision-maker enrichment) is kept instead of being lost.
+- **Wired into `enrichment_pipeline.run_enrichment_pipeline()`** as Step 9a, after all enrichment steps run (so the merge sees each notice's freshly-fetched data) and before final validation — every entry point (`daily`, `nc-daily`, `historical`, PDF import, photo import, CSV import) gets this automatically since they all funnel through the shared pipeline.
+- `data_formatter.deduplicate()` (pipeline Step 2, same-run only) does the equivalent merge for notices that collide within a single run, since two differently-ID'd notices for the same property can both appear inside one scrape's lookback window.
+
+## NC eCourts Portal (Special Proceedings Foreclosures)
+
+Third NC scrape source, alongside `ncnotices_scraper.py` (published sale notices). A power-of-sale foreclosure in NC is filed as a **Special Proceeding** (NCGS Chapter 45, Article 2A) — the trustee/substitute trustee files a "Notice of Hearing" with the Clerk of Superior Court *before* any sale notice is published in the newspaper. `src/ecourts_scraper.py` targets this SP filing directly at the statewide **NC eCourts Portal** (`portal-nc.tylertech.cloud`, Tyler Technologies Odyssey — all 100 counties as of the Oct 13, 2025 rollout), so this is materially first-to-market versus waiting for `ncnotices_scraper.py`'s newspaper publication weeks later.
+
+- **Target counties:** same 5 as `NC_SAVED_SEARCHES` — Wake, Durham, Orange, Guilford, Mecklenburg (`config.ECOURTS_TARGET_COUNTIES`).
+- **CLI:** `python src/main.py ecourts-daily` / `ecourts-historical`, same `--counties`/`--split`/`--since`/`--max-notices` flags as the other scrape modes.
+- **Key files:** `ecourts_scraper.py` (Scrapfly-driven fetch + search + result parsing), `ecourts_notice_parser.py` (case-type filtering + case metadata; reuses `nc_notice_parser._parse_address_nc` for property address since that logic is state-specific, not source-specific).
+- **Case-type filtering:** Special Proceedings covers far more than foreclosures (adoptions, guardianships, partitions, name changes, judicial sales, involuntary commitments). Only cases whose caption matches `foreclosure...of a...deed of trust/mortgage` are kept — see `ecourts_notice_parser.is_foreclosure_special_proceeding`.
+- **Dedup:** merges into the same `property_registry` key (`address+zip+notice_type+county`) as `ncnotices.com` foreclosures — an eCourts hit today and that property's later-published sale notice collapse into one lead instead of two.
+
+### Why Scrapfly instead of 2Captcha here (hard-won, 2026-07-19)
+
+`portal-nc.tylertech.cloud` is protected by **AWS WAF Bot Control** with a CAPTCHA "Human Verification" interstitial — not Google reCAPTCHA (`tnpublicnotice.com`) or Cloudflare Turnstile (`ncnotices.com`). Every unauthenticated Playwright navigation attempt was blocked immediately during initial testing. 2Captcha has no turnkey AWS WAF solving path the way it does for reCAPTCHA v2/Turnstile, so this source is built entirely on **Scrapfly's ASP (anti-scraping-protection) bypass** — no local Playwright browser at all; every page load is a `Scrapfly.async_scrape` call.
+
+**Known limitation — confirm before relying on this in production.** Scrapfly's ASP did **not** clear this specific WAF on any of 4 live attempts during initial testing (`ERR::ASP::SHIELD_PROTECTION_FAILED`, with and without `render_js`). This may just need Scrapfly-side tuning (dedicated proxy pool, a support ticket about this specific target) rather than being a dead end, but it has not yet been confirmed working end-to-end. `ecourts_scraper.py._scrapfly_fetch()` retries shield failures automatically, and `python src/ecourts_scraper.py --inspect --county Wake` dumps the raw fetched HTML to `output/` for manual selector calibration once/if the bypass starts succeeding. The Smart Search form-fill selectors in `_build_search_scenario()` are label-text-based (same resilience pattern as `ncnotices_scraper.py._select_county`) since the live DOM couldn't be inspected directly — calibrate them against a real `--inspect` dump before trusting this for daily runs. If Scrapfly's success rate stays low, 2Captcha's "Amazon WAF" task type is worth evaluating as an alternative.
+
+## NC Tax Delinquency Enrichment
+
+Extends enrichment pipeline Step 5 (tax delinquency) to the 5 NC target counties (`config.ECOURTS_TARGET_COUNTIES` — Wake, Durham, Orange, Guilford, Mecklenburg), which were previously Knox-only (`tax_enricher.py` is a Knox-County-TN-specific `mygovonline.com` client with no NC coverage). `src/nc_tax_enricher.py` runs alongside it in the same pipeline step, independently — a failure in one doesn't block the other.
+
+Unlike Knox's single REST API that covers address lookup, parcel lookup, and delinquency in one place, **each NC county publishes delinquent tax data through a completely different system** — there is one lookup path per county, not a shared client. All 4 automated sources below were confirmed live (2026-07-22) by actually downloading/querying them, not just reading vendor docs — one candidate source (see Guilford) turned out to be a different city's data entirely despite an identical schema, which is why every URL here was verified against real county addresses before being hardcoded.
+
+- **Wake:** Daily bulk XLSX at `services.wake.gov/collection_extracts/REAL_ESTATE_delq853_MMDDYYYY.xlsx` (date-stamped filename, `_wake_download()` walks back up to 5 days if today's hasn't posted). Has separate `Street_Number`/`STREET_NAME` columns, so no address-string parsing is needed — direct match. Grouped by `ACCOUNT_NUM` across multiple `TAX_YEAR` rows for a total amount + delinquent-year count. No auth; `services.wake.gov/robots.txt` blanket-disallows all bots (advisory only, doesn't block a scripted download, but keep the request rate polite).
+- **Durham:** An undocumented JSON endpoint on the county's Spatialest "Bill PWA" (`property.spatialest.com/nc/durham-tax/data/getData.php`, `POST qtype=delinquint_list` — note the vendor's own typo), found by reading the SPA's `main.js` for its AJAX calls since there's no published API docs. Returns the entire delinquent list (~3000 bills) in one stateless call, no session/cookies needed. **HTTPS is required — the HTTP version of the identical URL returns an empty 200 response**, which looks like a working-but-empty call unless you check both. Property address comes from the `AssetDescription` field (a single string, e.g. `"507 BERNICE ST DURHAM NC 27703"`), parsed with a regex. Tax year is derived from the `Bill` field's encoding (`0000118976-2025-2025-0000-00` → year `2025`) rather than a dedicated field.
+- **Guilford:** Delinquency lives in one ArcGIS FeatureServer (`services5.arcgis.com/RR1v7NWFfwk98pUn/.../Tax_Delinquent_Report_/FeatureServer/0`) keyed by `PARCEL_NUM` (=REID) with **no address field at all** — property address comes from a second ArcGIS FeatureServer, the county's own parcel/cadastral layer (`gcgis.guilfordcountync.gov/.../GC_Parcels/FeatureServer/0`), joined on REID. A wrong first draft of this source — a same-schema ArcGIS layer at a different org ID, found via a generic web search — turned out to be **Virginia Beach, VA's delinquent tax data**, not Guilford's (same vendor template, same field names, completely different city). Only found the real endpoint via the GIS Hub's DCAT feed (`open-data-hub-guilfordgis.hub.arcgis.com/api/feed/dcat-us/1.1.json`). Address→REID resolves to more than one REID for some addresses (adjoining/resubdivided parcels sharing a street address) — the lookup checks all candidates against the delinquent index rather than assuming the first result is right.
+- **Orange:** Annual bulk XLSX (published once, ~March, at `orangecountync.gov/DocumentCenter/View/27374`, cached 30 days) with owner name + legal description + parcel PIN + tax amount — **no property address column**. Joined by PIN against the county's ArcGIS parcel layer (`gis.orangecountync.gov/.../WebParcelService/MapServer/0`) for the actual situs address. Same multi-candidate-PIN issue as Guilford (confirmed live: `"2823 Butler Rd"` resolves to two different PINs, only one of which is delinquent) — same fix applies.
+- **Mecklenburg — no automated source found.** `tax.mecknc.gov` and `taxbill.co.mecklenburg.nc.us` both actively block automated fetches (robots.txt `Content-Signal: ai-train=no`, and the bill-search portal 403s outside a real browser/WAF-challenge session). The GIS parcel layers (Polaris3G) carry ownership/valuation but no delinquency status. NC law (GS 105-369) requires the county to compile a full "Delinquent Taxpayer List" annually, but the only confirmed access path is requesting it directly from the Office of Tax Administration (704-336-7600) as a public records request — not a scrapeable file. `nc_tax_enricher.py` logs a one-time skip note for Mecklenburg notices rather than silently doing nothing.
+
+**State:** Downloaded bulk files (Wake, Orange) cache to `nc_tax_cache/` (gitignored) — Wake re-checks daily, Orange reuses for 30 days. Durham and Guilford query live on every run (no local cache) since both are fast, complete-list API calls.
+
+**Address matching:** All 4 sources match on a loose `(house_number, first_street_word)` key (`nc_tax_enricher._address_key()`) rather than an exact string match, since notice addresses are scraped/OCR'd free text while county files carry the official situs address.
 
 ## Apify Deployment
 
@@ -220,6 +278,7 @@ DataSift.ai (formerly REISift) is the CRM where scraped records land for niche s
 - **Lists + Notes (2):** Lists (for niche sequential), Notes (contextual per notice type)
 - **Built-in fields (13):** Estimated Value, MSL Status, Last Sale Date/Price, Equity Percentage, Tax Deliquent Value, Tax Delinquent Year, Tax Auction Date, Foreclosure Date, Probate Open Date, Personal Representative, Parcel ID, Structure Type, Year Built, Living SqFt, Bedrooms, Bathrooms, Lot (Acres)
 - **Custom fields (15):** Notice Type, County, Date Added, Owner Deceased, Date of Death, Decedent Name, Decision Maker, DM Relationship, DM Confidence, DM 2/3 Name/Relationship, Obituary URL, Source URL
+- **NARRPR RVM fields (5, added alongside Source URL):** RVM Value, RVM Value Low, RVM Value High, RVM Confidence, RVM Updated Date — second AVM cross-check against the built-in Estimated Value (Zestimate). Also present in the plain `data_formatter.write_csv()` output (non-DataSift CSV).
 
 ### Niche Sequential Marketing
 DataSift's niche sequential system uses filter presets to guide records through SMS → Call → Mail → Deep Prospecting phases. Two preset folders: "00 Niche Sequential Marketing" (12 presets, courthouse data) and "01. Bulk Sequential Marketing" (9 presets, bulk data). All 21 presets exclude Sold status (build 1.0.23). A "Sold Property Cleanup" sequence in the Transactions folder auto-fires on "Sold" tag to change status, remove from lists, clear tasks, and clear assignee.
