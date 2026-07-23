@@ -87,6 +87,18 @@ jobs:
           path: output/
           retention-days: 30
 
+      - name: Upload DataSift debug screenshots
+        # datasift_core.login() and datasift_uploader.py drop diagnostic
+        # screenshots (datasift_*.png) in the working directory on failure —
+        # without this they're silently discarded when the runner is torn
+        # down, leaving login/upload failures undiagnosable.
+        if: always() && hashFiles('datasift_*.png') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: siftstack-datasift-debug-${{ github.run_id }}
+          path: datasift_*.png
+          retention-days: 14
+
       - name: Save scraper state
         if: always()
         uses: actions/cache/save@v4

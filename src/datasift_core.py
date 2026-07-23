@@ -175,13 +175,34 @@ async def login(page, email: str = None, password: str = None) -> bool:
     try:
         await page.wait_for_url("**/dashboard/general**", timeout=15000)
     except PwTimeout:
-        if "/login" in page.url:
-            logger.error("DataSift login failed — still on login page")
+        if "/dashboard" not in page.url and "/records" not in page.url:
+            await _log_login_failure(page)
             return False
 
     await save_cookies(page)
     logger.info("DataSift login successful")
     return True
+
+
+async def _log_login_failure(page) -> None:
+    """Capture screenshot + visible page text to diagnose a failed login.
+
+    A bare "still on login page" log gives no signal on *why* (wrong
+    credentials, an account lockout, a security/CAPTCHA challenge, or a
+    selector that no longer matches the live form) — especially important
+    in headless CI where there's no way to watch it happen.
+    """
+    logger.error("DataSift login failed — url=%s", page.url)
+    try:
+        await screenshot(page, "login_failed")
+    except Exception as e:
+        logger.debug("Login-failure screenshot failed: %s", e)
+    try:
+        body_text = await page.locator("body").inner_text(timeout=5000)
+        snippet = " ".join(body_text.split())[:500]
+        logger.error("DataSift login page text: %s", snippet)
+    except Exception as e:
+        logger.debug("Login-failure text capture failed: %s", e)
 
 
 # ── UI Primitives ─────────────────────────────────────────────────────
