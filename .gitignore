@@ -14,6 +14,7 @@ captcha_failed_ids.json
 cookies.json
 datasift_cookies.json
 narrpr_cookies.json
+datasift_*.png
 dropbox_state.json
 photo_state.json
 *.tmp

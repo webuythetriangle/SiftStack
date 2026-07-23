@@ -136,8 +136,6 @@ async def login(page, email: str = None, password: str = None) -> bool:
     Tries saved cookies first, falls back to fresh login.
     If email/password not provided, loads from environment.
     """
-    from playwright.async_api import TimeoutError as PwTimeout
-
     if not email or not password:
         email, password = get_credentials()
 
@@ -171,13 +169,19 @@ async def login(page, email: str = None, password: str = None) -> bool:
     # Click Sign In
     await page.get_by_role("button", name="Sign In").click()
 
-    # Wait for navigation away from login page
-    try:
-        await page.wait_for_url("**/dashboard/general**", timeout=15000)
-    except PwTimeout:
-        if "/dashboard" not in page.url and "/records" not in page.url:
-            await _log_login_failure(page)
-            return False
+    # Don't trust a specific post-submit redirect target — DataSift's
+    # post-login landing route has changed before (2026-07: /dashboard/general
+    # started 404ing while the SPA still showed the authenticated shell at a
+    # /login URL), which made a `wait_for_url("**/dashboard/general**")`
+    # check misreport every successful login as a failure. Instead, give the
+    # SPA a moment then explicitly land on a route we know is stable —
+    # the same DATASIFT_RECORDS_URL check the cookie-reuse path above uses.
+    await page.wait_for_timeout(4000)
+    await page.goto(DATASIFT_RECORDS_URL, wait_until="domcontentloaded")
+    await page.wait_for_timeout(3000)
+    if "/login" in page.url:
+        await _log_login_failure(page)
+        return False
 
     await save_cookies(page)
     logger.info("DataSift login successful")
