@@ -32,17 +32,22 @@ def _build_client(auth_id: str, auth_token: str):
     return ClientBuilder(credentials).build_us_street_api_client()
 
 
-def _build_lastline(notice: NoticeData) -> str:
-    """Build a 'city, state zip' lastline string from notice fields."""
-    parts = []
-    if notice.city:
-        parts.append(notice.city)
-    if notice.state:
-        parts.append(notice.state)
-    lastline = ", ".join(parts)
-    if notice.zip:
-        lastline += " " + notice.zip if lastline else notice.zip
-    return lastline or "TN"
+def _apply_geo_fields(lookup: StreetLookup, notice: NoticeData) -> None:
+    """Set city/state/zipcode as separate structured fields on the lookup.
+
+    Previously combined into a single free-text `lastline` string (e.g.
+    "Durham, NC 27701"). When city was blank (as with NC tax foreclosure
+    notices, which don't state the property's city inline — see
+    nc_notice_parser.NC_TAX_FORECLOSURE_ADDR_RE), that collapsed to a bare
+    "NC" with no comma, and Smarty's lastline parser sometimes echoed that
+    ambiguous token back as if it were the city name (observed: city came
+    back "Nc"), which then blocked USPS confirmation and the Data
+    Validation zip check. Structured fields have no such ambiguity — an
+    empty city is unambiguously "no city", not "city named NC".
+    """
+    lookup.city = notice.city
+    lookup.state = notice.state
+    lookup.zipcode = notice.zip
 
 
 def standardize_addresses(
@@ -93,7 +98,7 @@ def standardize_addresses(
         for orig_idx, notice in batch_slice:
             lookup = StreetLookup()
             lookup.street = notice.address
-            lookup.lastline = _build_lastline(notice)
+            _apply_geo_fields(lookup, notice)
             lookup.candidates = 1
             lookup.match = MatchType.INVALID
             lookup.input_id = str(orig_idx)
@@ -291,7 +296,7 @@ def retry_with_geocoded_city(
         for orig_idx, notice in batch_slice:
             lookup = StreetLookup()
             lookup.street = notice.address
-            lookup.lastline = _build_lastline(notice)
+            _apply_geo_fields(lookup, notice)
             lookup.candidates = 1
             lookup.match = MatchType.INVALID
             lookup.input_id = str(orig_idx)

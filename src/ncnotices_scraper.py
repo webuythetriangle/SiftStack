@@ -32,8 +32,12 @@ from config import (
     NC_SEARCH_URL,
     NC_SEL_COUNTY_LIST,
     NC_SEL_COUNTY_TOGGLE,
+    NC_SEL_DATE_FROM_INPUT,
+    NC_SEL_DATE_RANGE_RADIO,
     NC_SEL_DATE_TOGGLE,
+    NC_SEL_DATE_TO_INPUT,
     NC_SEL_LAST_NUM_DAYS_INPUT,
+    NC_SEL_MATCH_ANY_WORDS_LABEL,
     NC_SEL_NEXT_PAGE_BUTTON,
     NC_SEL_PAGE_INFO,
     NC_SEL_PER_PAGE_DROPDOWN,
@@ -44,13 +48,14 @@ from config import (
     NC_SEL_VIEW_NOTICE_BUTTON,
     NC_TURNSTILE_SITEKEY,
     MAX_RETRIES,
+    NC_SEARCH_RESTART_LIMIT,
     REQUEST_DELAY_MAX,
     REQUEST_DELAY_MIN,
     RESULTS_PER_PAGE,
     NCSearch,
 )
 from data_formatter import _notice_id_from_url
-from foreclosure_filter import is_valid_foreclosure
+from foreclosure_filter import is_tax_foreclosure, is_valid_foreclosure
 from nc_notice_parser import parse_nc_notice_text
 from notice_parser import NoticeData
 
@@ -113,6 +118,21 @@ async def _set_date_range_days(page: Page, days: int) -> None:
     await page.fill(NC_SEL_LAST_NUM_DAYS_INPUT, str(days))
 
 
+async def _set_date_range_custom(page: Page, date_from: str, date_to: str) -> None:
+    """Open the date panel and set an explicit From/To range (M/D/YYYY, e.g. '4/23/2026').
+
+    Only the trailing 12 months are available on this search page at all —
+    the site's own note: "Notices for the past 12 months are available in
+    the current search. Use the Archive Search to find notices older than
+    12 months." Older ranges need /Archive/ArchiveSearch.aspx, not
+    implemented here.
+    """
+    await _open_panel(page, NC_SEL_DATE_TOGGLE)
+    await page.click(NC_SEL_DATE_RANGE_RADIO)
+    await page.fill(NC_SEL_DATE_FROM_INPUT, date_from)
+    await page.fill(NC_SEL_DATE_TO_INPUT, date_to)
+
+
 async def _get_page_info(page: Page) -> tuple[int, int]:
     """Parse 'Page X of Y Pages' text. Returns (current_page, total_pages)."""
     try:
@@ -146,18 +166,113 @@ async def run_nc_search(
     days_back: int,
     max_notices: int = 0,
     seen_ids: dict[str, str] | None = None,
+    date_range: tuple[str, str] | None = None,
 ) -> list[NoticeData]:
-    """Run one NCSearch (county + keyword), paginate, and scrape each notice."""
-    logger.info("Running NC search: %s / %s (last %d days)", search.county, search.keyword, days_back)
+    """Run one NCSearch (county + keyword), paginate, and scrape each notice.
+
+    date_range, if given, is an explicit (from, to) pair in M/D/YYYY format
+    and overrides days_back — used for scraping a specific historical slice
+    (e.g. months 4-6 ago) rather than a rolling "last N days" window. Only
+    the trailing 12 months are available on this search page regardless
+    (see _set_date_range_custom).
+
+    If the results page's DOM goes stale mid-scan (see _scrape_nc_results_page's
+    page_crashed signal), restarts up to NC_SEARCH_RESTART_LIMIT times. A
+    restart re-navigates and re-submits the search (unavoidable — ASP.NET
+    ViewState is lost) but fast-forwards straight to the page it crashed on
+    via "next page" clicks rather than re-processing every already-seen
+    notice on earlier pages one at a time. Earlier versions of this restart
+    replayed the whole search from page 1 every time, which cost ~5-6s per
+    already-collected notice just to reach the same failure point again —
+    on a crash deep into page 2+ that made recovery itself the slow part
+    (see Durham 12-mo run 2026-07-23: nearly an hour, most of it re-walking
+    an already-scraped page 1 twice). seen_ids still guards against
+    re-adding a notice if the fast-forward ever lands off by one page.
+    """
+    all_notices: list[NoticeData] = []
+    resume_page = 1
+
+    for attempt in range(1, NC_SEARCH_RESTART_LIMIT + 1):
+        remaining = (max_notices - len(all_notices)) if max_notices else 0
+        try:
+            notices, crashed, crashed_on_page = await _run_nc_search_once(
+                page, search, days_back, max_notices=remaining, seen_ids=seen_ids,
+                start_page=resume_page, date_range=date_range,
+            )
+        except Exception:
+            # An uncaught error here (e.g. page.goto timing out re-navigating
+            # to the search form on a restart) must NOT discard all_notices
+            # collected on prior attempts — that's exactly what happened on
+            # a Guilford 12-mo run (2026-07-23): two attempts had already
+            # collected ~26 notices before a third attempt's re-navigation
+            # timed out, and the whole function returned empty because the
+            # exception propagated straight out of this loop.
+            logger.exception(
+                "  %s / %s errored re-navigating on restart attempt %d — treating as another stall",
+                search.county, search.keyword, attempt,
+            )
+            notices, crashed, crashed_on_page = [], True, resume_page
+        all_notices.extend(notices)
+
+        if max_notices and len(all_notices) >= max_notices:
+            all_notices = all_notices[:max_notices]
+            break
+
+        if not crashed:
+            break
+
+        resume_page = crashed_on_page
+        if attempt < NC_SEARCH_RESTART_LIMIT:
+            logger.warning(
+                "  %s / %s stalled mid-scan on page %d — restarting search, "
+                "fast-forwarding back to page %d (attempt %d/%d)",
+                search.county, search.keyword, crashed_on_page, resume_page,
+                attempt + 1, NC_SEARCH_RESTART_LIMIT,
+            )
+        else:
+            logger.error(
+                "  %s / %s still stalling after %d attempts — giving up with %d notices collected",
+                search.county, search.keyword, NC_SEARCH_RESTART_LIMIT, len(all_notices),
+            )
+
+    logger.info("  Found %d notices for %s / %s", len(all_notices), search.county, search.keyword)
+    return all_notices
+
+
+async def _run_nc_search_once(
+    page: Page,
+    search: NCSearch,
+    days_back: int,
+    max_notices: int = 0,
+    seen_ids: dict[str, str] | None = None,
+    start_page: int = 1,
+    date_range: tuple[str, str] | None = None,
+) -> tuple[list[NoticeData], bool, int]:
+    """One full search-and-paginate attempt. Returns (notices, stalled, stalled_on_page)."""
+    if date_range:
+        logger.info("Running NC search: %s / %s (%s to %s)", search.county, search.keyword, *date_range)
+    else:
+        logger.info("Running NC search: %s / %s (last %d days)", search.county, search.keyword, days_back)
 
     await page.goto(NC_SEARCH_URL, wait_until="networkidle", timeout=30_000)
     await delay()
 
     await page.fill(NC_SEL_SEARCH_KEYWORD, search.keyword)
-    await _set_date_range_days(page, days_back)
+    if " " in search.keyword.strip():
+        # Multi-word keyword ("foreclosure trustee") is meant as OR matching,
+        # not "all words must appear" (the site's default) — see
+        # NC_SAVED_SEARCHES for why. The radio click can trigger its own
+        # postback, so settle before touching the date/county panels next.
+        await page.click(NC_SEL_MATCH_ANY_WORDS_LABEL)
+        await page.wait_for_load_state("networkidle")
+        await page.wait_for_timeout(500)
+    if date_range:
+        await _set_date_range_custom(page, *date_range)
+    else:
+        await _set_date_range_days(page, days_back)
 
     if not await _select_county(page, search.county):
-        return []
+        return [], False, 1
 
     await page.click(NC_SEL_SEARCH_SUBMIT, force=True)
     await page.wait_for_timeout(1500)
@@ -166,13 +281,27 @@ async def run_nc_search(
     body_text = await page.inner_text("body")
     if "No public notices found" in body_text:
         logger.info("  0 results for %s / %s", search.county, search.keyword)
-        return []
+        return [], False, 1
 
     await _set_per_page(page)
 
     notices: list[NoticeData] = []
     current_page, total_pages = await _get_page_info(page)
     logger.info("  %d page(s) of results", total_pages)
+
+    # Fast-forward to the page we crashed on last attempt, via cheap "next
+    # page" clicks — not by re-processing every notice on earlier pages.
+    while current_page < start_page and current_page < total_pages:
+        next_btn = await page.query_selector(NC_SEL_NEXT_PAGE_BUTTON)
+        can_advance = next_btn and not await next_btn.get_attribute("disabled") if next_btn else False
+        if not can_advance:
+            break
+        await next_btn.click()
+        await page.wait_for_load_state("networkidle")
+        await delay()
+        current_page, total_pages = await _get_page_info(page)
+    if start_page > 1:
+        logger.info("  Fast-forwarded to page %d/%d", current_page, total_pages)
 
     while True:
         logger.info("  Scraping page %d/%d", current_page, total_pages)
@@ -187,8 +316,7 @@ async def run_nc_search(
             break
 
         if page_crashed:
-            logger.error("  Browser page crashed — stopping this search early")
-            break
+            return notices, True, current_page
 
         if current_page >= total_pages:
             break
@@ -203,8 +331,7 @@ async def run_nc_search(
         await delay()
         current_page, total_pages = await _get_page_info(page)
 
-    logger.info("  Found %d notices for %s / %s", len(notices), search.county, search.keyword)
-    return notices
+    return notices, False, current_page
 
 
 async def _scrape_nc_results_page(
@@ -236,7 +363,19 @@ async def _scrape_nc_results_page(
             try:
                 view_buttons = await page.query_selector_all(NC_SEL_VIEW_BUTTON_PATTERN)
                 if idx >= len(view_buttons):
-                    break
+                    # num_results was captured once at the top of this page's scrape and
+                    # shouldn't shrink — this means the page navigated somewhere unexpected
+                    # (e.g. a stalled retry left it on a stale/logged-out view). Silently
+                    # treating this as "no more results" previously caused a stalled page to
+                    # look like a clean, complete run (see Durham 12-mo run 2026-07-22: only
+                    # 19 of 82 results were ever examined, no error surfaced). Signal a crash
+                    # instead so the caller restarts the whole search from scratch.
+                    logger.error(
+                        "  Expected result %d but only %d view buttons present — "
+                        "page state looks stale, aborting this page's scrape",
+                        idx + 1, len(view_buttons),
+                    )
+                    return notices, True
                 btn = view_buttons[idx]
 
                 # Row metadata: publication/date/city/county, captured before navigating.
@@ -282,11 +421,15 @@ async def _scrape_nc_results_page(
                 if seen_ids is not None and notice_id:
                     seen_ids[notice_id] = notice.date_added or datetime.now().strftime("%Y-%m-%d")
 
-                if not is_valid_foreclosure(notice):
-                    logger.debug("  Filtered out (not foreclosure): %s", notice.source_url)
-                else:
+                if is_valid_foreclosure(notice):
                     notices.append(notice)
                     logger.debug("  Kept notice: %s", notice.source_url)
+                elif is_tax_foreclosure(notice):
+                    notice.notice_type = "tax_foreclosure"
+                    notices.append(notice)
+                    logger.debug("  Kept tax foreclosure notice: %s", notice.source_url)
+                else:
+                    logger.debug("  Filtered out (not foreclosure): %s", notice.source_url)
 
                 await page.go_back()
                 await page.wait_for_load_state("networkidle")
@@ -419,6 +562,7 @@ async def scrape_all_nc(
     days_back: int | None = None,
     max_notices: int = 0,
     seen_ids: dict[str, str] | None = None,
+    date_range: tuple[str, str] | None = None,
 ) -> list[NoticeData]:
     """Scrape ncnotices.com for the given NCSearch list.
 
@@ -426,6 +570,9 @@ async def scrape_all_nc(
         mode: "daily" (default 7-day window) or "historical" (default 365 days).
               Ignored if days_back is explicitly set.
         days_back: Explicit lookback window in days — overrides mode default.
+        date_range: Explicit (from, to) M/D/YYYY pair — overrides both mode
+            and days_back, for scraping a specific historical slice (e.g.
+            months 4-6 ago). See run_nc_search / _set_date_range_custom.
     """
     if searches is None:
         searches = config.NC_SAVED_SEARCHES
@@ -454,6 +601,7 @@ async def scrape_all_nc(
             try:
                 search_notices = await run_nc_search(
                     page, search, days_back, max_notices=remaining, seen_ids=seen_ids,
+                    date_range=date_range,
                 )
                 all_notices.extend(search_notices)
             except Exception:

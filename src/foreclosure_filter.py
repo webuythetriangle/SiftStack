@@ -96,3 +96,29 @@ def is_valid_foreclosure(notice: NoticeData) -> bool:
     # No inclusion phrase matched — exclude by default
     logger.debug("Excluded foreclosure (no trustee sale language): %s", notice.source_url)
     return False
+
+
+# ── Tax foreclosure classification ──────────────────────────────────────
+# A judicial "in rem"/in-personam tax foreclosure (county/city suing a
+# delinquent-tax owner for a court Judgment, case captioned e.g. "County of
+# Durham and City of Durham vs. Estate of X and Heirs") is a legally distinct
+# process from the power-of-sale trustee foreclosure above — no deed of
+# trust, no trustee, no substitute-trustee language. ncnotices.com's single
+# "foreclosure" keyword search returns both kinds mixed together; this is
+# only ever checked against notices that already failed is_valid_foreclosure,
+# so a genuine trustee sale can never be misclassified here.
+TAX_FORECLOSURE_PHRASES = [
+    "tax foreclosure",
+    "in rem tax foreclosure",
+    "foreclosure of tax lien",
+    "foreclosure of the tax lien",
+    "foreclosure of tax liens",
+]
+
+
+def is_tax_foreclosure(notice: NoticeData) -> bool:
+    """Detect a judicial tax foreclosure sale notice (county/city vs. delinquent owner)."""
+    text = notice.raw_text.lower()
+    if not text:
+        return False
+    return any(phrase in text for phrase in TAX_FORECLOSURE_PHRASES)

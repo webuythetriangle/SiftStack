@@ -117,6 +117,12 @@ REQUEST_DELAY_MAX = 3.0
 MAX_RETRIES = 3
 RESULTS_PER_PAGE = 50  # max the site allows
 
+# ncnotices_scraper: if the results-page DOM goes stale mid-scan (e.g. a
+# transient network stall corrupts browser state), restart the whole
+# county/keyword search from scratch this many times before giving up.
+# seen_ids lets a restart skip notices already collected instead of redoing them.
+NC_SEARCH_RESTART_LIMIT = 3
+
 # ── Image Processing ───────────────────────────────────────────────────
 BLUR_THRESHOLD = int(os.getenv("BLUR_THRESHOLD", "100"))   # Laplacian variance; below = rejected as blurry
 TESSERACT_PSM_PDF = 3    # fully automatic — best for PDF tax sale tables
@@ -153,11 +159,20 @@ NC_SEARCH_URL = f"{NC_BASE_URL}/Search.aspx"
 # Search form (Search.aspx) — county/date panels are collapsed by default
 # and must be opened (click the toggle div) before their inputs are usable.
 NC_SEL_SEARCH_KEYWORD = "#ctl00_ContentPlaceHolder1_as1_txtSearch"
+# "All Words" (rdoType_0, default) / "Any Words" (rdoType_1) / "Exact Phrase" (rdoType_2).
+NC_SEL_MATCH_ANY_WORDS_LABEL = "label[for='ctl00_ContentPlaceHolder1_as1_rdoType_1']"
 NC_SEL_COUNTY_TOGGLE = "#ctl00_ContentPlaceHolder1_as1_divCounty"
 NC_SEL_COUNTY_LIST = "#ctl00_ContentPlaceHolder1_as1_lstCounty"
 NC_SEL_DATE_TOGGLE = "#ctl00_ContentPlaceHolder1_as1_divDateRange"
 NC_SEL_LAST_NUM_DAYS_RADIO = "#ctl00_ContentPlaceHolder1_as1_rbLastNumDays"
 NC_SEL_LAST_NUM_DAYS_INPUT = "#ctl00_ContentPlaceHolder1_as1_txtLastNumDays"
+# Custom From/To range — site note: "past 12 months are available in the
+# current search... use Archive Search for notices older than 12 months"
+# (/Archive/ArchiveSearch.aspx, not implemented here — out of scope until
+# something actually needs data older than a year).
+NC_SEL_DATE_RANGE_RADIO = "#ctl00_ContentPlaceHolder1_as1_rbRange"
+NC_SEL_DATE_FROM_INPUT = "#ctl00_ContentPlaceHolder1_as1_txtDateFrom"
+NC_SEL_DATE_TO_INPUT = "#ctl00_ContentPlaceHolder1_as1_txtDateTo"
 NC_SEL_SEARCH_SUBMIT = "#ctl00_ContentPlaceHolder1_as1_btnGo"
 
 # Search results grid
@@ -178,6 +193,11 @@ class NCSearch:
     county: str
     notice_type: str  # Only "foreclosure" is supported today — see NC_SAVED_SEARCHES note
     keyword: str
+    # Note: the "foreclosure" keyword search returns both power-of-sale trustee
+    # foreclosures and judicial tax foreclosures mixed together. ncnotices_scraper
+    # reclassifies the tax ones to notice_type="tax_foreclosure" per-notice after
+    # fetching (see foreclosure_filter.is_tax_foreclosure) — no separate search
+    # needed, so tax foreclosures ride along automatically wherever this search runs.
 
 
 # ── NC Saved Searches ───────────────────────────────────────────────────
@@ -190,12 +210,21 @@ class NCSearch:
 # files for tax delinquency, county Sheriff's office for tax sale, and
 # city/county code-enforcement portals for code violations) and need their
 # own separate integrations — not in scope here.
+# Keyword is "foreclosure trustee" (not just "foreclosure") searched with Any
+# Words matching — confirmed live (Durham, 2026-07-23) that some genuine
+# power-of-sale and HOA-lien trustee sale notices are titled "NOTICE OF SALE"
+# or "NOTICE OF TRUSTEE'S SALE OF REAL PROPERTY" and never use the word
+# "foreclosure" anywhere in the text, so a "foreclosure"-only search silently
+# missed them. Every genuine trustee sale necessarily mentions "trustee"
+# (that's who executes it), so OR-ing the two catches both phrasings.
+# ncnotices_scraper._run_nc_search_once selects the "Any Words" radio
+# automatically whenever a keyword contains more than one word.
 NC_SAVED_SEARCHES: list[NCSearch] = [
-    NCSearch("Wake", "foreclosure", "foreclosure"),
-    NCSearch("Durham", "foreclosure", "foreclosure"),
-    NCSearch("Orange", "foreclosure", "foreclosure"),
-    NCSearch("Guilford", "foreclosure", "foreclosure"),
-    NCSearch("Mecklenburg", "foreclosure", "foreclosure"),
+    NCSearch("Wake", "foreclosure", "foreclosure trustee"),
+    NCSearch("Durham", "foreclosure", "foreclosure trustee"),
+    NCSearch("Orange", "foreclosure", "foreclosure trustee"),
+    NCSearch("Guilford", "foreclosure", "foreclosure trustee"),
+    NCSearch("Mecklenburg", "foreclosure", "foreclosure trustee"),
 ]
 
 # ── NC eCourts Portal (Tyler Technologies Odyssey — statewide, all 100 NC

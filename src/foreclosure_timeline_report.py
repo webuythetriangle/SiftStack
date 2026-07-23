@@ -124,6 +124,7 @@ def load_from_csvs(paths: list[str], county_filter: list[str] | None) -> list[No
 
 def scrape_live(
     counties: list[str], months_back: int, max_notices: int, no_enrich: bool = False,
+    date_range: tuple[str, str] | None = None,
 ) -> tuple[list[NoticeData], list[NoticeData]]:
     """Run a live NC (ncnotices.com) historical foreclosure scrape + enrichment.
 
@@ -140,6 +141,12 @@ def scrape_live(
     no external calls) still run, since those are needed to get a clean
     property list. This trades the equity/value/MLS-status columns (blank in
     the output) for a fast raw notice-timeline snapshot with no API calls.
+
+    date_range, if given, is an explicit (from, to) M/D/YYYY pair that
+    overrides months_back — for scraping a specific historical slice (e.g.
+    a big county split into quarters across several days instead of one
+    long run). See ncnotices_scraper.run_nc_search. Only the trailing 12
+    months are available at all (site limitation, not ours).
     """
     import config as cfg
     from enrichment_pipeline import PipelineOptions, run_enrichment_pipeline
@@ -156,13 +163,17 @@ def scrape_live(
         )
 
     days_back = 30 * months_back
-    logger.info("Scraping %d NC saved search(es), last %d days...", len(searches), days_back)
+    if date_range:
+        logger.info("Scraping %d NC saved search(es), %s to %s...", len(searches), *date_range)
+    else:
+        logger.info("Scraping %d NC saved search(es), last %d days...", len(searches), days_back)
 
     raw_notices = asyncio.run(scrape_all_nc(
         mode="historical",
         searches=searches,
         days_back=days_back,
         max_notices=max_notices,
+        date_range=date_range,
     ))
     logger.info("Scrape returned %d raw notices", len(raw_notices))
 
@@ -867,6 +878,15 @@ def main() -> None:
     parser.add_argument("--scrape", action="store_true", help="Run a live NC (ncnotices.com) historical foreclosure scrape")
     parser.add_argument("--counties", nargs="+", help="Counties to scrape (NC: Wake, Durham, Orange, Guilford, Mecklenburg)")
     parser.add_argument("--months-back", type=int, default=12, help="Lookback window for --scrape (default: 12)")
+    parser.add_argument(
+        "--date-from", default=None, metavar="M/D/YYYY",
+        help="Explicit range start for --scrape (overrides --months-back; requires --date-to). "
+             "Only the trailing 12 months are available at all (site limitation).",
+    )
+    parser.add_argument(
+        "--date-to", default=None, metavar="M/D/YYYY",
+        help="Explicit range end for --scrape (overrides --months-back; requires --date-from)",
+    )
     parser.add_argument("--max-notices", type=int, default=0, help="Cap notices scraped (0 = no cap)")
     parser.add_argument(
         "--no-enrich", action="store_true",
@@ -887,8 +907,12 @@ def main() -> None:
     if args.scrape:
         if not args.counties:
             parser.error("--scrape requires --counties")
+        if bool(args.date_from) != bool(args.date_to):
+            parser.error("--date-from and --date-to must be given together")
+        date_range = (args.date_from, args.date_to) if args.date_from else None
         raw_notices, final_notices = scrape_live(
             args.counties, args.months_back, args.max_notices, no_enrich=args.no_enrich,
+            date_range=date_range,
         )
         final_notices = [n for n in final_notices if n.notice_type == "foreclosure"]
         raw_count = len(raw_notices)

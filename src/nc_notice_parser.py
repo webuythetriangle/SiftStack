@@ -110,6 +110,28 @@ NC_LOCATED_AT_ADDR_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Tax foreclosure notices (judicial sale, "County of X vs. ... Judgment") don't
+# use "commonly known as"/"located at" phrasing at all — the property is
+# introduced by the legal description itself, e.g. "...more particularly
+# described as follows: 1823 Nixon Street Durham County Tax Parcel 132849...".
+# No comma/city/zip follows the address here, unlike the indicator patterns
+# above, so this only captures the address itself.
+NC_TAX_FORECLOSURE_ADDR_RE = re.compile(
+    r"(?:more\s+particularly\s+)?described\s+as\s+follows\s*:?\s*" + _ADDR_PART,
+    re.IGNORECASE,
+)
+
+# Fallback city for tax foreclosure notices: NCGS-mandated boilerplate always
+# states where the public auction is held, e.g. "...at public auction, at
+# the Durham County Justice Center, 510 South Dillard Street, in Durham,
+# North Carolina, at 12:00...". That's the county seat/courthouse city, not
+# necessarily the property's own city, but it's a real, present-in-every-notice
+# value that lets Smarty resolve a zip — Smarty's own USPS lookup corrects the
+# city if the street only exists in a different city within the same county.
+_NC_SALE_LOCATION_CITY_RE = re.compile(
+    r"\bin\s+([A-Z][\w\s]*?),\s*North\s+Carolina",
+)
+
 _BAD_ADDR_WORDS = [
     "courthouse", "court house", "county building", "city building",
     "city county", "register", "office of", "entrance",
@@ -215,6 +237,21 @@ def _parse_address_nc(notice: NoticeData) -> None:
         if not is_sale_location and _is_valid_address(addr):
             notice.address = addr
             _extract_city_zip_near_nc(notice, text, m.end())
+            return
+
+    m = NC_TAX_FORECLOSURE_ADDR_RE.search(text)
+    if m:
+        addr = _clean_address(m.group(1))
+        if _is_valid_address(addr):
+            notice.address = addr
+            # No property city/zip follows inline in this notice format —
+            # fall back to the sale-location city (see
+            # _NC_SALE_LOCATION_CITY_RE) so Smarty has something to
+            # disambiguate on; city_hint from the search row fills in first
+            # if it's actually present and isn't a garbage state-abbreviation.
+            city_m = _NC_SALE_LOCATION_CITY_RE.search(text)
+            if city_m:
+                notice.city = _clean_city(city_m.group(1))
             return
 
 

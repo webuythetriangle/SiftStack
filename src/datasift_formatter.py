@@ -220,6 +220,7 @@ def _split_name(full_name: str) -> tuple[str, str]:
 # DataSift auto-creates lists from CSV if they don't exist yet.
 NOTICE_TYPE_TO_LIST = {
     "foreclosure": "Foreclosure",
+    "tax_foreclosure": "Tax Foreclosure",
     "probate": "Probate",
     "tax_sale": "Tax Sale",
     "tax_delinquent": "Tax Delinquent",
@@ -700,7 +701,7 @@ def _build_row(notice: NoticeData, notes_override: str | None = None) -> dict:
     tax_auction = ""
     foreclosure_date = ""
     probate_open = ""
-    if notice.notice_type == "tax_sale":
+    if notice.notice_type in ("tax_sale", "tax_foreclosure"):
         tax_auction = _format_date(notice.auction_date)
     elif notice.notice_type == "foreclosure":
         foreclosure_date = _format_date(notice.auction_date)

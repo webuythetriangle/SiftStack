@@ -1,0 +1,123 @@
+name: Guilford Quarterly Foreclosure Scrape
+
+# One-off, 4-day chunked scrape of Guilford County's trailing 12 months on
+# ncnotices.com, split into non-overlapping 3-month slices instead of one
+# 12-month run. Guilford has ~20 pages of "foreclosure trustee" search
+# results (vs. e.g. Durham's ~2), and a single 12-month run stalled
+# repeatedly under load without completing (2026-07-23) — quarterly slices
+# keep each run small enough to actually finish, and the property registry
+# (seen_properties.json, cached below) means quarter 2+ recognizes leads
+# already captured in an earlier quarter instead of re-adding them.
+#
+# Each schedule entry below is a specific calendar date (not a recurring
+# pattern) — cron's day-of-month + month fields pin it to one date, so this
+# fires once per line and then not again for a year. Delete this file (or
+# the schedule block) once all 4 have run; it's not meant to be permanent.
+#
+# Dates chosen 2026-07-23, anchored to that date's trailing 12 months:
+#   Day 1 (2026-07-24, 9am ET): last 3 months      = 4/23/2026 to 7/23/2026
+#   Day 2 (2026-07-25, 9am ET): 4-6 months ago      = 1/23/2026 to 4/23/2026
+#   Day 3 (2026-07-26, 9am ET): 7-9 months ago      = 10/23/2025 to 1/23/2026
+#   Day 4 (2026-07-27, 9am ET): 10-12 months ago    = 7/23/2025 to 10/23/2025
+# 9am ET = 13:00 UTC (EDT, UTC-4, in effect through these dates).
+
+on:
+  schedule:
+    - cron: "0 13 24 7 *"
+    - cron: "0 13 25 7 *"
+    - cron: "0 13 26 7 *"
+    - cron: "0 13 27 7 *"
+  workflow_dispatch:
+    inputs:
+      date_from:
+        description: "Override range start (M/D/YYYY) — leave blank to use the scheduled quarter for today's date"
+        required: false
+      date_to:
+        description: "Override range end (M/D/YYYY) — leave blank to use the scheduled quarter for today's date"
+        required: false
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Install Playwright Chromium
+        run: python -m playwright install --with-deps chromium
+
+      # Isolated from daily.yml's own siftstack-state-* cache on purpose —
+      # this is a one-off analysis run, not the production daily pipeline,
+      # and shouldn't read or overwrite its state.
+      - name: Restore property registry state
+        uses: actions/cache/restore@v4
+        with:
+          path: seen_properties.json
+          key: guilford-quarterly-state-${{ github.run_id }}
+          restore-keys: |
+            guilford-quarterly-state-
+
+      - name: Determine date range for this run
+        id: daterange
+        run: |
+          case "${{ github.event.schedule }}" in
+            "0 13 24 7 *") FROM="4/23/2026";  TO="7/23/2026" ;;
+            "0 13 25 7 *") FROM="1/23/2026";  TO="4/23/2026" ;;
+            "0 13 26 7 *") FROM="10/23/2025"; TO="1/23/2026" ;;
+            "0 13 27 7 *") FROM="7/23/2025";  TO="10/23/2025" ;;
+            *) FROM="${{ inputs.date_from }}"; TO="${{ inputs.date_to }}" ;;
+          esac
+          if [ -z "$FROM" ] || [ -z "$TO" ]; then
+            echo "No date range resolved (manual dispatch needs date_from/date_to inputs)"; exit 1
+          fi
+          echo "date_from=$FROM" >> "$GITHUB_OUTPUT"
+          echo "date_to=$TO" >> "$GITHUB_OUTPUT"
+          echo "Scraping Guilford: $FROM to $TO"
+
+      - name: Run Guilford quarterly scrape
+        env:
+          CAPTCHA_API_KEY: ${{ secrets.CAPTCHA_API_KEY }}
+          SMARTY_AUTH_ID: ${{ secrets.SMARTY_AUTH_ID }}
+          SMARTY_AUTH_TOKEN: ${{ secrets.SMARTY_AUTH_TOKEN }}
+          OPENWEBNINJA_API_KEY: ${{ secrets.OPENWEBNINJA_API_KEY }}
+          NARRPR_EMAIL: ${{ secrets.NARRPR_EMAIL }}
+          NARRPR_PASSWORD: ${{ secrets.NARRPR_PASSWORD }}
+        run: |
+          python src/foreclosure_timeline_report.py --scrape --counties Guilford \
+            --date-from "${{ steps.daterange.outputs.date_from }}" \
+            --date-to "${{ steps.daterange.outputs.date_to }}" \
+            --output "output/Guilford_Foreclosure_Analysis_$(date +%Y%m%d)_$(echo '${{ steps.daterange.outputs.date_from }}' | tr '/' '-').xlsx" \
+            -v
+
+      - name: Upload output
+        if: always() && hashFiles('output/**') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: guilford-quarterly-${{ github.run_id }}
+          path: output/
+          retention-days: 30
+
+      - name: Save property registry state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: seen_properties.json
+          key: guilford-quarterly-state-${{ github.run_id }}
+
+      - name: Notify Slack on failure
+        if: failure()
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          curl -sf -X POST -H 'Content-type: application/json' \
+            --data "{\"text\": \":rotating_light: Guilford quarterly scrape failed (${{ steps.daterange.outputs.date_from }} to ${{ steps.daterange.outputs.date_to }}) — run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"}" \
+            "$SLACK_WEBHOOK_URL"
