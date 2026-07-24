@@ -415,6 +415,40 @@ def run_enrichment_pipeline(
     else:
         logger.info("── Step 6a: Commercial Property Filter (skipped) ──")
 
+    # ── Step 6b: Property Registry Pre-Check ─────────────────────────
+    # Skip Zillow (8) / NARRPR (8b) / obituary (9) entirely for notices that
+    # are almost certainly an unchanged re-notice of an already-known
+    # property (same auction date/owner/decedent as last run, just a new
+    # notice ID) — those cost money or, for NARRPR, sign the user out of
+    # their own single-session account for zero new information. Placed
+    # right after Smarty (Step 6) since the registry key needs a
+    # Smarty-standardized address to reliably match a prior run's entry —
+    # entity research (3a) and tax delinquency (5) already ran earlier and
+    # can't be skipped by this check. This is purely an optimization:
+    # Step 9a below still does the authoritative merge/suppression check on
+    # the rejoined list either way.
+    _registry = None
+    _unchanged_precheck: list[NoticeData] = []
+    try:
+        from property_registry import load_registry, precheck_unchanged
+
+        _registry = load_registry()
+        before = len(notices)
+        notices, _unchanged_precheck = precheck_unchanged(notices, _registry)
+        if _unchanged_precheck:
+            logger.info(
+                "── Step 6b: Property Registry Pre-Check — %d/%d unchanged re-notices, skipping enrichment for them ──",
+                len(_unchanged_precheck),
+                before,
+            )
+        else:
+            logger.info(
+                "── Step 6b: Property Registry Pre-Check — no unchanged repeats, all %d proceed ──",
+                before,
+            )
+    except Exception as e:
+        logger.warning("  Property registry pre-check failed: %s", e)
+
     # ── Step 7: Reverse Geocode Retry ────────────────────────────────
     if (
         not opts.skip_geocode
@@ -532,6 +566,12 @@ def run_enrichment_pipeline(
     # Merge each notice onto its previously-known record (from this run's
     # earlier same-property notices, or a prior run) so a re-published/
     # amended notice updates the existing lead instead of duplicating it.
+    # Repeats with no material change (same auction date, price, etc.) are
+    # dropped from output entirely rather than re-uploaded to DataSift. This
+    # also rejoins the notices Step 6b pulled out early (already merged with
+    # their prior record) — reconcile_with_registry re-derives the same
+    # merge idempotently for them and is the single source of truth for
+    # what actually gets suppressed.
     logger.info("── Step 9a: Property Registry Reconciliation ──")
     try:
         from property_registry import (
@@ -541,17 +581,22 @@ def run_enrichment_pipeline(
             update_registry,
         )
 
-        registry = load_registry()
-        notices, updated_count = reconcile_with_registry(notices, registry)
+        notices = notices + _unchanged_precheck
+        registry = _registry if _registry is not None else load_registry()
+        notices, all_merged, updated_count, suppressed_count = reconcile_with_registry(
+            notices, registry
+        )
         if updated_count:
             logger.info(
-                "  %d/%d properties matched a previously-scraped lead — merged as updates",
+                "  %d properties matched a previously-scraped lead — %d had material updates, %d were unchanged re-notices (dropped from output)",
                 updated_count,
-                len(notices),
+                updated_count - suppressed_count,
+                suppressed_count,
             )
+            logger.info("  %d properties in this run's output", len(notices))
         else:
             logger.info("  No matches — all %d properties are new", len(notices))
-        update_registry(registry, notices)
+        update_registry(registry, all_merged)
         save_registry(registry)
     except Exception as e:
         logger.warning("  Property registry reconciliation failed: %s", e)
