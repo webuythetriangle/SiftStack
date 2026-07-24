@@ -56,16 +56,17 @@ async def upload_csv(
     list_name: str | None = None,
     existing_list: bool = False,
 ) -> dict:
-    """Upload a CSV file to DataSift via the 7-step upload wizard.
+    """Upload a CSV file to DataSift via the upload wizard.
 
-    Wizard steps:
-    1. Click "Upload File" in sidebar
-    2. Choose "Add data" or "Update data"
-    3. "Let's Stay Organized" questions
-    4. Tags step (CSV has Tags column — skip adding custom tags)
-    5. Browse/upload CSV file
-    6. Map columns (auto-maps recognized headers)
-    7. Review and "Finish Upload"
+    Click "Upload File" in the sidebar, then wizard steps (DataSift added
+    the Enrichment step on 2026-07-24, shifting everything after Setup down
+    by one — Add tags/Upload/Map columns/Review used to be steps 2-5):
+    1. Setup: choose "Add data"/"Update data", "Let's Stay Organized" questions
+    2. Enrichment (Swap Owners toggle — leave off, just advance)
+    3. Tags step (CSV has Tags column — skip adding custom tags)
+    4. Browse/upload CSV file
+    5. Map columns (auto-maps recognized headers)
+    6. Review and "Finish Upload"
 
     Args:
         page: Logged-in Playwright page.
@@ -97,6 +98,27 @@ async def upload_csv(
         await page.goto(DATASIFT_UPLOAD_URL, wait_until="domcontentloaded")
     # Wait for SPA to fully render (longer for headless/cloud environments)
     await page.wait_for_timeout(8000)
+
+    # When upload_csv() is called more than once in the same page/session
+    # (e.g. upload_datasift_split, or a manual backfill loop), the previous
+    # upload's wizard modal can be left open — the Review step doesn't
+    # explicitly close it, it just waits for a success indicator or times
+    # out. A leftover `Modalstyles__ModalOverlay` then intercepts every
+    # click on this page, including "Upload File", with no useful error
+    # ("waiting for element to be visible, enabled and stable" retries
+    # forever). Since we skip re-navigating when already on /records (line
+    # above), that stale modal survives into the next call — clear it here
+    # unconditionally before doing anything else.
+    try:
+        await page.keyboard.press("Escape")
+        await page.evaluate("""() => {
+            document.querySelectorAll('[class*="ModalOverlay"], [class*="Modalstyles"]').forEach(
+                el => el.remove()
+            );
+        }""")
+        await page.wait_for_timeout(500)
+    except Exception as e:
+        logger.debug("Stale modal cleanup: %s", e)
 
     # Dismiss notifications popup if present
     try:
@@ -303,10 +325,21 @@ async def upload_csv(
     # Click "Next Step" to proceed to step 2
     await _click_next_step(page, timeout=30000)
 
-    # ── Wizard Step 2: Add tags ──
-    logger.info("Wizard Step 2: Adding 'Courthouse Data' tag...")
+    # ── Wizard Step 2: Enrichment ──
+    # DataSift added this step (2026-07-24) between Setup and Add tags —
+    # "Auto-Enrichment" with a "Swap Owners" toggle, which we leave off
+    # (same reasoning as "Swap Owners" OFF in the separate Manage → Enrich
+    # Data step post-upload: protects our PR/DM contact mapping). No fields
+    # to fill here, just advance past it.
+    logger.info("Wizard Step 2: Enrichment (leaving Swap Owners off)...")
     await page.wait_for_timeout(1000)
-    await _screenshot(page, "step2_tags")
+    await _screenshot(page, "step2_enrichment")
+    await _click_next_step(page)
+
+    # ── Wizard Step 3: Add tags ──
+    logger.info("Wizard Step 3: Adding 'Courthouse Data' tag...")
+    await page.wait_for_timeout(1000)
+    await _screenshot(page, "step3_tags")
 
     # Add "Courthouse Data" tag via the Custom Tags input on the right side
     try:
@@ -319,7 +352,7 @@ async def upload_csv(
             await page.wait_for_timeout(300)
             await tag_input.first.type("Courthouse Data", delay=50)
             await page.wait_for_timeout(1500)
-            await _screenshot(page, "step2_tag_typed")
+            await _screenshot(page, "step3_tag_typed")
 
             # Check if "Courthouse Data" appears in autocomplete dropdown — click it
             tag_option = page.locator('text="Courthouse Data"')
@@ -365,7 +398,7 @@ async def upload_csv(
                     await page.wait_for_timeout(1000)
                     logger.info("Added 'Courthouse Data' tag (via Enter fallback)")
 
-            await _screenshot(page, "step2_tag_added")
+            await _screenshot(page, "step3_tag_added")
         else:
             logger.warning("Tag input not found — 'Courthouse Data' tag NOT added")
     except Exception as e:
@@ -373,10 +406,10 @@ async def upload_csv(
 
     await _click_next_step(page)
 
-    # ── Wizard Step 3: Upload the file ──
-    logger.info("Wizard Step 3: Uploading CSV file: %s", csv_path.name)
+    # ── Wizard Step 4: Upload the file ──
+    logger.info("Wizard Step 4: Uploading CSV file: %s", csv_path.name)
     await page.wait_for_timeout(3000)
-    await _screenshot(page, "step3_before_upload")
+    await _screenshot(page, "step4_before_upload")
 
     try:
         file_input = page.locator('input[type="file"]')
@@ -393,7 +426,7 @@ async def upload_csv(
             logger.info("CSV file selected: %s", csv_path.name)
             await page.wait_for_timeout(3000)
         else:
-            await _screenshot(page, "step3_no_file_input")
+            await _screenshot(page, "step4_no_file_input")
             result["message"] = "Could not find file input element"
             logger.error(result["message"])
             return result
@@ -402,13 +435,13 @@ async def upload_csv(
         logger.error(result["message"])
         return result
 
-    await _screenshot(page, "step3_file_uploaded")
+    await _screenshot(page, "step4_file_uploaded")
     await _click_next_step(page)
 
-    # ── Wizard Step 4: Map the columns ──
-    logger.info("Wizard Step 4: Column mapping — mapping Tags and Lists...")
+    # ── Wizard Step 5: Map the columns ──
+    logger.info("Wizard Step 5: Column mapping — mapping Tags and Lists...")
     await page.wait_for_timeout(3000)
-    await _screenshot(page, "step4_column_mapping")
+    await _screenshot(page, "step5_column_mapping")
 
     # Try to drag unmapped columns (left side) to their targets (right side)
     # DataSift uses styled-components with draggable="false" — need slow mouse drag
@@ -464,16 +497,16 @@ async def upload_csv(
         except Exception as e:
             logger.warning("Column mapping %s failed: %s", col_name, e)
 
-    await _screenshot(page, "step4_after_mapping")
+    await _screenshot(page, "step5_after_mapping")
 
     # Click Next Step to proceed past mapping
     await _click_next_step(page)
-    await _screenshot(page, "step4_mapping_done")
+    await _screenshot(page, "step5_mapping_done")
 
-    # ── Wizard Step 5: Review ──
-    logger.info("Wizard Step 5: Review and finish upload...")
+    # ── Wizard Step 6: Review ──
+    logger.info("Wizard Step 6: Review and finish upload...")
     await page.wait_for_timeout(2000)
-    await _screenshot(page, "step5_review")
+    await _screenshot(page, "step6_review")
 
     try:
         finish_btn = page.locator(
@@ -485,7 +518,7 @@ async def upload_csv(
             await finish_btn.first.click()
             logger.info("Clicked Finish Upload")
         else:
-            await _screenshot(page, "step5_no_finish_btn")
+            await _screenshot(page, "step6_no_finish_btn")
             logger.warning("Finish Upload button not found")
     except Exception as e:
         logger.warning("Finish step: %s", e)
@@ -505,7 +538,7 @@ async def upload_csv(
         result["message"] = success_text or "Upload completed"
         logger.info("DataSift upload complete: %s", result["message"])
     except PwTimeout:
-        await _screenshot(page, "step5_timeout")
+        await _screenshot(page, "step6_timeout")
         result["message"] = "Upload may have succeeded but confirmation timed out — check Activity page"
         logger.warning(result["message"])
         result["success"] = True
