@@ -1,0 +1,74 @@
+name: Guilford Property Notice Lookup
+
+# One-off diagnostic run: look up ALL ncnotices.com foreclosure notices for a
+# short list of specific addresses whose merged date_added (first notice
+# date) turned out to be wrong -- see src/lookup_property_notices.py and the
+# merge_notice_data fix in src/property_registry.py (2026-07-29). Not a
+# recurring scrape; trigger manually, then delete this file once the 18
+# known-bad Guilford properties (output/Guilford_bad_date_cases.csv, from
+# the 4-quarter consolidation) have been corrected.
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  lookup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Install Playwright Chromium
+        run: python -m playwright install --with-deps chromium
+
+      - name: Write address list
+        run: |
+          cat > guilford_bad_dates.csv <<'EOF'
+          quarter,owner_name,address,city,zip,current_first_notice,auction_date
+          Q4,,4695 Beligan Drive,Gibsonville,27249,2025-10-22,2025-09-18
+          Q4,,5500 Sire Crossing Ct,Gibsonville,27249,2025-10-22,2025-09-18
+          Q4,,18 Windrock Way,Greensboro,27455,2025-09-17,2025-08-21
+          Q4,,801 E Commerce Ave,High Point,27260,2025-08-21,2025-07-31
+          Q4,,429 Tate St,High Point,27260,2025-08-21,2025-07-31
+          Q4,,507 E Grimes Ave,High Point,27260,2025-08-21,2025-07-31
+          Q3,,345 E Montcastle Dr,Greensboro,27406,2026-01-21,2025-11-20
+          Q3,Matthew J. Linden,513 Broad Ave,Greensboro,27406,2025-11-26,2023-06-26
+          Q3,,3724 Spanish Peak Dr,High Point,27265,2025-11-19,2025-10-08
+          Q2,"Jeremy D. Biven, Karla E.",7 Fieldale Ct,Greensboro,27406,2026-03-04,2021-12-21
+          Q2,,5022 Braham Trail,Greensboro,27405,2026-02-18,2026-01-22
+          Q2,,4709 Tuliptree Dr,Greensboro,27455,2026-02-18,2026-01-22
+          Q2,,4427 Reedy Fork Pkwy,Greensboro,27405,2026-02-18,2026-01-22
+          Q1,,1403 Red Sail Ln,Greensboro,27410,2026-07-20,2026-07-07
+          Q1,,1403 W Lexington Ave,High Point,27262,2026-07-15,2026-06-09
+          Q1,Cynthia A. Everett And Ch,5613 Hicone Rd,Gibsonville,27249,2026-07-08,2026-02-05
+          Q1,Margaret Gwendolyn Hatfie,2105 Maywood St,Greensboro,27403,2026-06-22,2026-06-09
+          Q1,,4929 W Market St,Greensboro,27407,2026-06-16,2026-06-09
+          EOF
+
+      - name: Run address lookup
+        env:
+          CAPTCHA_API_KEY: ${{ secrets.CAPTCHA_API_KEY }}
+        run: |
+          python src/lookup_property_notices.py \
+            --input guilford_bad_dates.csv \
+            --county Guilford \
+            --days-back 365 \
+            --output output/property_notice_lookup.csv \
+            -v
+
+      - name: Upload output
+        if: always() && hashFiles('output/**') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: guilford-address-lookup-${{ github.run_id }}
+          path: output/
+          retention-days: 30

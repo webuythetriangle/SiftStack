@@ -93,11 +93,22 @@ def merge_notice_data(base: NoticeData, overlay: NoticeData) -> NoticeData:
 
     Used both to collapse same-run duplicate notices for one property and to
     reconcile a freshly-scraped notice against a previously-exported record.
+
+    date_added is the one deliberate exception: it tracks when the property
+    was *first* noticed, so a later re-publish/amended notice must never
+    overwrite it with its own (newer) publish date — that would make
+    "first notice" drift forward over successive re-notices, eventually
+    landing after auction_date. Always keep the earliest non-empty value.
     """
     merged = {
         f.name: (getattr(overlay, f.name) or getattr(base, f.name))
         for f in fields(NoticeData)
     }
+    base_date, overlay_date = base.date_added.strip(), overlay.date_added.strip()
+    if base_date and overlay_date:
+        merged["date_added"] = min(base_date, overlay_date)
+    else:
+        merged["date_added"] = overlay_date or base_date
     return NoticeData(**merged)
 
 

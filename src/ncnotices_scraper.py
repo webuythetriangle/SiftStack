@@ -167,6 +167,7 @@ async def run_nc_search(
     max_notices: int = 0,
     seen_ids: dict[str, str] | None = None,
     date_range: tuple[str, str] | None = None,
+    require_all_words: bool = False,
 ) -> list[NoticeData]:
     """Run one NCSearch (county + keyword), paginate, and scrape each notice.
 
@@ -175,6 +176,13 @@ async def run_nc_search(
     (e.g. months 4-6 ago) rather than a rolling "last N days" window. Only
     the trailing 12 months are available on this search page regardless
     (see _set_date_range_custom).
+
+    require_all_words, when True, skips the "Any Words" OR-matching radio
+    even for a multi-word keyword, leaving the site's default AND matching.
+    NC_SAVED_SEARCHES' "foreclosure trustee" keyword wants OR (either word
+    is enough), but a free-text street-address keyword (e.g. "4695 Beligan
+    Drive") wants every word to match — OR would return every notice
+    containing just "Drive" or the ZIP digits. See lookup_property_notices.py.
 
     If the results page's DOM goes stale mid-scan (see _scrape_nc_results_page's
     page_crashed signal), restarts up to NC_SEARCH_RESTART_LIMIT times. A
@@ -198,6 +206,7 @@ async def run_nc_search(
             notices, crashed, crashed_on_page = await _run_nc_search_once(
                 page, search, days_back, max_notices=remaining, seen_ids=seen_ids,
                 start_page=resume_page, date_range=date_range,
+                require_all_words=require_all_words,
             )
         except Exception:
             # An uncaught error here (e.g. page.goto timing out re-navigating
@@ -247,6 +256,7 @@ async def _run_nc_search_once(
     seen_ids: dict[str, str] | None = None,
     start_page: int = 1,
     date_range: tuple[str, str] | None = None,
+    require_all_words: bool = False,
 ) -> tuple[list[NoticeData], bool, int]:
     """One full search-and-paginate attempt. Returns (notices, stalled, stalled_on_page)."""
     if date_range:
@@ -258,7 +268,7 @@ async def _run_nc_search_once(
     await delay()
 
     await page.fill(NC_SEL_SEARCH_KEYWORD, search.keyword)
-    if " " in search.keyword.strip():
+    if " " in search.keyword.strip() and not require_all_words:
         # Multi-word keyword ("foreclosure trustee") is meant as OR matching,
         # not "all words must appear" (the site's default) — see
         # NC_SAVED_SEARCHES for why. The radio click can trigger its own
@@ -563,6 +573,7 @@ async def scrape_all_nc(
     max_notices: int = 0,
     seen_ids: dict[str, str] | None = None,
     date_range: tuple[str, str] | None = None,
+    require_all_words: bool = False,
 ) -> list[NoticeData]:
     """Scrape ncnotices.com for the given NCSearch list.
 
@@ -573,6 +584,8 @@ async def scrape_all_nc(
         date_range: Explicit (from, to) M/D/YYYY pair — overrides both mode
             and days_back, for scraping a specific historical slice (e.g.
             months 4-6 ago). See run_nc_search / _set_date_range_custom.
+        require_all_words: see run_nc_search — pass True for free-text
+            (e.g. address) keywords instead of the OR-style saved searches.
     """
     if searches is None:
         searches = config.NC_SAVED_SEARCHES
@@ -601,7 +614,7 @@ async def scrape_all_nc(
             try:
                 search_notices = await run_nc_search(
                     page, search, days_back, max_notices=remaining, seen_ids=seen_ids,
-                    date_range=date_range,
+                    date_range=date_range, require_all_words=require_all_words,
                 )
                 all_notices.extend(search_notices)
             except Exception:
