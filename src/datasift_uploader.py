@@ -32,13 +32,22 @@ async def _click_next_step(page: Page, timeout: int = 20000) -> bool:
 
     Default timeout is 20s to handle slow SPA rendering in headless/cloud
     environments (Apify containers take longer than local desktop).
+
+    Scoped to the wizard modal (`[class*="Modalstyles"], [class*="ModalOverlay"]`
+    — the same class pattern used elsewhere for stale-modal cleanup) rather
+    than the whole page. A page-wide text selector can resolve `.first` to a
+    hidden button elsewhere on the page (e.g. a proactive chat-widget bubble
+    that showed up in DataSift's UI, unrelated to the wizard) and then wait
+    forever for that unrelated element to become visible, even though the
+    real "Next Step" button in the modal is visible on screen the whole time.
     """
+    modal = page.locator('[class*="Modalstyles"], [class*="ModalOverlay"]')
+    btn = modal.locator(
+        'button:has-text("Next Step"), '
+        'button:has-text("Next"), '
+        'button:has-text("Continue")'
+    )
     try:
-        btn = page.locator(
-            'button:has-text("Next Step"), '
-            'button:has-text("Next"), '
-            'button:has-text("Continue")'
-        )
         await btn.first.wait_for(state="visible", timeout=timeout)
         await btn.first.click()
         await page.wait_for_timeout(2000)
@@ -323,7 +332,11 @@ async def upload_csv(
     await _screenshot(page, "step1_form_filled")
 
     # Click "Next Step" to proceed to step 2
-    await _click_next_step(page, timeout=30000)
+    if not await _click_next_step(page, timeout=30000):
+        await _screenshot(page, "step1_next_failed")
+        result["message"] = "Could not advance past Setup step (Next Step button)"
+        logger.error(result["message"])
+        return result
 
     # ── Wizard Step 2: Enrichment ──
     # DataSift added this step (2026-07-24) between Setup and Add tags —
@@ -334,7 +347,11 @@ async def upload_csv(
     logger.info("Wizard Step 2: Enrichment (leaving Swap Owners off)...")
     await page.wait_for_timeout(1000)
     await _screenshot(page, "step2_enrichment")
-    await _click_next_step(page)
+    if not await _click_next_step(page):
+        await _screenshot(page, "step2_next_failed")
+        result["message"] = "Could not advance past Enrichment step (Next Step button)"
+        logger.error(result["message"])
+        return result
 
     # ── Wizard Step 3: Add tags ──
     logger.info("Wizard Step 3: Adding 'Courthouse Data' tag...")
@@ -404,7 +421,11 @@ async def upload_csv(
     except Exception as e:
         logger.warning("Tag addition failed: %s", e)
 
-    await _click_next_step(page)
+    if not await _click_next_step(page):
+        await _screenshot(page, "step3_next_failed")
+        result["message"] = "Could not advance past Add Tags step (Next Step button)"
+        logger.error(result["message"])
+        return result
 
     # ── Wizard Step 4: Upload the file ──
     logger.info("Wizard Step 4: Uploading CSV file: %s", csv_path.name)
@@ -436,7 +457,11 @@ async def upload_csv(
         return result
 
     await _screenshot(page, "step4_file_uploaded")
-    await _click_next_step(page)
+    if not await _click_next_step(page):
+        await _screenshot(page, "step4_next_failed")
+        result["message"] = "Could not advance past Upload File step (Next Step button)"
+        logger.error(result["message"])
+        return result
 
     # ── Wizard Step 5: Map the columns ──
     logger.info("Wizard Step 5: Column mapping — mapping Tags and Lists...")
@@ -500,7 +525,11 @@ async def upload_csv(
     await _screenshot(page, "step5_after_mapping")
 
     # Click Next Step to proceed past mapping
-    await _click_next_step(page)
+    if not await _click_next_step(page):
+        await _screenshot(page, "step5_next_failed")
+        result["message"] = "Could not advance past Map Columns step (Next Step button)"
+        logger.error(result["message"])
+        return result
     await _screenshot(page, "step5_mapping_done")
 
     # ── Wizard Step 6: Review ──
