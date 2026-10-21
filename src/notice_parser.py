@@ -76,6 +76,7 @@ class NoticeData:
     parcel_id: str = ""                # County assessor parcel ID
     tax_delinquent_amount: str = ""    # Total delinquent tax owed ($)
     tax_delinquent_years: str = ""     # Number of years delinquent
+    taxable_value: str = ""            # County-assessed taxable/assessed value ($)
     # Deceased owner detection
     deceased_indicator: str = ""       # "life_estate", "personal_rep", "trustee", "care_of", "et_al", or ""
     tax_owner_name: str = ""           # Raw owner name from county tax API

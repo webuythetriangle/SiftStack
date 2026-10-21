@@ -909,6 +909,44 @@ def _run_csv_import(args) -> None:
     logging.info("Done — %d records exported", len(notices))
 
 
+def _run_tax_delinquent_screen(args) -> None:
+    """Canvas raw county tax-delinquent data for deceased owners and screen
+
+    by years unpaid / amount owed / taxable value. See
+    tax_delinquent_screener.py module docstring for per-county data sources
+    and known gaps (Durham has no taxable-value source; Orange has no
+    per-year breakdown).
+    """
+    import config as cfg
+    from tax_delinquent_screener import run as run_tax_screen
+
+    if not args.county:
+        logging.error("--county is required for tax-delinquent-screen mode")
+        sys.exit(1)
+
+    if args.county == "wake" and args.input and not args.input.exists():
+        logging.error("Input file not found: %s", args.input)
+        sys.exit(1)
+
+    output_path = args.output or (
+        cfg.OUTPUT_DIR
+        / f"tax_delinquent_screen_{args.county}_{datetime.now().strftime('%Y-%m-%d')}.csv"
+    )
+
+    passed = run_tax_screen(
+        county=args.county,
+        input_path=args.input,
+        output_path=output_path,
+        api_key=cfg.ANTHROPIC_API_KEY,
+        skip_obituary=args.skip_obituary,
+    )
+    deceased = sum(1 for n in passed if n.owner_deceased == "yes")
+    logging.info(
+        "Done — %d records passed the screen (%d confirmed deceased owner), output: %s",
+        len(passed), deceased, output_path,
+    )
+
+
 def _run_phone_validate(args) -> None:
     """Run phone validation via Trestle API with DataSift export/upload."""
     import json as _json
@@ -1056,6 +1094,7 @@ def cli_main() -> None:
             "ecourts-daily", "ecourts-historical",
             "pdf-import", "photo-import", "dropbox-watch",
             "csv-import", "phone-validate", "manage-sold", "manage-presets",
+            "tax-delinquent-screen",
             # New analysis & workflow modes
             "comp", "rehab", "analyze-deal", "market-analysis", "buyer-prospect",
             "deep-prospect", "lead-manage", "setup-sequences", "niche-sequential",
@@ -1068,6 +1107,8 @@ def cli_main() -> None:
             "pdf-import/photo-import = import from files; "
             "dropbox-watch = poll Dropbox; csv-import = re-enrich CSV; "
             "phone-validate = Trestle scoring; manage-sold/manage-presets = DataSift ops; "
+            "tax-delinquent-screen = canvas raw county tax-delinquent data for deceased "
+            "owners + screen by years unpaid/amount owed/taxable value; "
             "comp = comparable sales ARV; rehab = rehab cost estimate; "
             "analyze-deal = full deal analysis; market-analysis = zip code scoring; "
             "buyer-prospect = cash buyer lists; deep-prospect = 4-level research; "
@@ -1489,6 +1530,17 @@ def cli_main() -> None:
     parser.add_argument("--team-size", type=int, default=1,
                         help="Team size 1/2/5 (playbook mode)")
 
+    # Tax delinquent screen
+    parser.add_argument("--county", type=str, default=None,
+                        choices=["wake", "durham", "orange", "guilford"],
+                        help="County to screen (tax-delinquent-screen mode)")
+    parser.add_argument("--input", type=Path, default=None,
+                        help="Raw county export path (tax-delinquent-screen mode; "
+                             "wake only — durham/orange/guilford are always fetched live). "
+                             "If omitted for wake, today's file is auto-downloaded.")
+    parser.add_argument("--output", type=Path, default=None,
+                        help="Output CSV path (tax-delinquent-screen mode)")
+
     args = parser.parse_args()
 
     # Apply LLM backend override from CLI flag
@@ -1729,6 +1781,11 @@ def cli_main() -> None:
     # CSV re-import mode — separate pipeline
     if args.mode == "csv-import":
         _run_csv_import(args)
+        return
+
+    # Raw tax-delinquent data screen — separate pipeline
+    if args.mode == "tax-delinquent-screen":
+        _run_tax_delinquent_screen(args)
         return
 
     # NC (ncnotices.com) scrape mode — separate pipeline
