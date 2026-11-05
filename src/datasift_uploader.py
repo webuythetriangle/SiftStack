@@ -10,6 +10,7 @@ Requires: DATASIFT_EMAIL and DATASIFT_PASSWORD in .env or environment.
 
 import logging
 import os
+import re
 from pathlib import Path
 
 import config
@@ -55,6 +56,71 @@ async def _click_next_step(page: Page, timeout: int = 20000) -> bool:
     except PwTimeout:
         logger.warning("Next Step button not found within %dms", timeout)
         return False
+
+
+# CSV column → DataSift field in the upload wizard's "Map the columns" step.
+# Only columns DataSift doesn't auto-map AND that have a target field in the
+# account. Estimated Value, Year Built, Bedrooms, RVM *, etc. have no target
+# field in the wizard and stay unmapped (SiftMap enrichment fills those).
+UPLOAD_COLUMN_MAP = {
+    "Tags": "Tags",
+    "Lists": "Lists",
+    "Parcel ID": "APN",
+    "Tax Deliquent Value": "Tax delinquency amount",
+}
+
+
+def _exact_name(name: str) -> re.Pattern:
+    # Custom-field targets render a "Custom" badge inside the name element
+    return re.compile(rf"^\s*{re.escape(name)}\s*(Custom)?\s*$")
+
+
+async def _map_upload_columns(page: Page, column_map: dict[str, str]) -> list[str]:
+    """Drag CSV columns onto DataSift fields; return the CSV columns verified mapped."""
+    mapped = []
+    for src_name, tgt_name in column_map.items():
+        src_name_loc = page.locator(
+            '[class*="UploadModalForeignColumnName"]', has_text=_exact_name(src_name))
+        src = page.locator('[class*="UploadModalForeignColumn-"]').filter(has=src_name_loc).first
+        tgt = page.locator('[class*="UploadModalOwnColumn-"]').filter(
+            has=page.locator('[class*="UploadModalOwnColumnName"]',
+                             has_text=_exact_name(tgt_name))).first
+        try:
+            if await src.count() == 0:
+                logger.debug("Column %s: not in CSV or already auto-mapped", src_name)
+                continue
+            if await tgt.count() == 0:
+                logger.warning("Column %s: no '%s' field in DataSift — left unmapped",
+                               src_name, tgt_name)
+                continue
+            await src.evaluate("el => el.scrollIntoView({block: 'center'})")
+            await tgt.evaluate("el => el.scrollIntoView({block: 'center'})")
+            await page.wait_for_timeout(400)
+            s = await src.bounding_box()
+            t = await tgt.bounding_box()
+            if not s or not t:
+                logger.warning("Column %s: card not visible", src_name)
+                continue
+            sx, sy = s["x"] + s["width"] / 2, s["y"] + s["height"] / 2
+            tx, ty = t["x"] + t["width"] / 2, t["y"] + t["height"] / 2
+            await page.mouse.move(sx, sy)
+            await page.mouse.down()
+            await page.wait_for_timeout(300)
+            steps = 20
+            for i in range(1, steps + 1):
+                await page.mouse.move(sx + (tx - sx) * i / steps, sy + (ty - sy) * i / steps)
+                await page.wait_for_timeout(40)
+            await page.wait_for_timeout(300)
+            await page.mouse.up()
+            await page.wait_for_timeout(1000)
+            if await src_name_loc.count() == 0:
+                logger.info("Mapped column: %s -> %s", src_name, tgt_name)
+                mapped.append(src_name)
+            else:
+                logger.warning("Column %s: drag did not map to '%s'", src_name, tgt_name)
+        except Exception as e:
+            logger.warning("Column mapping %s failed: %s", src_name, e)
+    return mapped
 
 
 async def upload_csv(
@@ -464,63 +530,19 @@ async def upload_csv(
         return result
 
     # ── Wizard Step 5: Map the columns ──
-    logger.info("Wizard Step 5: Column mapping — mapping Tags and Lists...")
+    logger.info("Wizard Step 5: Column mapping — mapping Tags, Lists, APN...")
     await page.wait_for_timeout(3000)
     await _screenshot(page, "step5_column_mapping")
 
-    # Try to drag unmapped columns (left side) to their targets (right side)
-    # DataSift uses styled-components with draggable="false" — need slow mouse drag
-    async def _drag_column(source_el, target_el):
-        """Drag a CSV column card to a mapping target using slow mouse moves."""
-        src_box = await source_el.bounding_box()
-        dst_box = await target_el.bounding_box()
-        if not src_box or not dst_box:
-            return False
-        sx = src_box["x"] + src_box["width"] / 2
-        sy = src_box["y"] + src_box["height"] / 2
-        dx = dst_box["x"] + dst_box["width"] / 2
-        dy = dst_box["y"] + dst_box["height"] / 2
-        await page.mouse.move(sx, sy)
-        await page.wait_for_timeout(500)
-        await page.mouse.down()
-        await page.wait_for_timeout(500)
-        steps = 20
-        for i in range(1, steps + 1):
-            frac = i / steps
-            await page.mouse.move(
-                sx + (dx - sx) * frac,
-                sy + (dy - sy) * frac,
-            )
-            await page.wait_for_timeout(50)
-        await page.wait_for_timeout(500)
-        await page.mouse.up()
-        await page.wait_for_timeout(1000)
-        return True
-
-    # Map Tags column: find "Tags" card on left, drag to "Tags" target on right
-    for col_name in ["Tags", "Lists"]:
-        try:
-            # Source: unmapped column card on the left (contains column name + sample data)
-            source = page.locator(f'div:has-text("{col_name}") >> visible=true').first
-            # Target: mapping slot on the right side (search for it)
-            # Right-side targets have the field name — search within right panel area
-            target = page.locator(f'text="{col_name}"').last
-            if await source.count() > 0 and await target.count() > 0:
-                src_box = await source.bounding_box()
-                tgt_box = await target.bounding_box()
-                # Ensure source is on left (<600px) and target is on right (>600px)
-                if src_box and tgt_box and src_box["x"] < 600 and tgt_box["x"] > 600:
-                    if await _drag_column(source, target):
-                        logger.info("Mapped column: %s", col_name)
-                        await page.wait_for_timeout(1000)
-                    else:
-                        logger.warning("Drag failed for column: %s", col_name)
-                else:
-                    logger.debug("Column %s: no valid source/target positions", col_name)
-            else:
-                logger.debug("Column %s: source or target not found", col_name)
-        except Exception as e:
-            logger.warning("Column mapping %s failed: %s", col_name, e)
+    # Drag unmapped CSV columns (left panel) onto DataSift fields (right panel).
+    # Left cards are `UploadModalForeignColumn`, right targets are
+    # `UploadModalOwnColumn`; each panel scrolls independently, so both must be
+    # scrolled into view before the drag or the drop lands off-screen (the old
+    # page-wide `div:has-text("Tags")` locator matched an outer page container
+    # and logged "Mapped" without ever mapping anything — calibrated live
+    # 2026-10-29). Success is verified by the card leaving the left panel.
+    mapped = await _map_upload_columns(page, UPLOAD_COLUMN_MAP)
+    result["mapped_columns"] = mapped
 
     await _screenshot(page, "step5_after_mapping")
 
@@ -623,21 +645,22 @@ async def _filter_by_list(page: Page, list_name: str) -> bool:
             await filter_search.first.fill("Lists")
             await page.wait_for_timeout(1500)
 
-            # Click "All Lists (AND)" in the suggestions dropdown (inside the overlay)
-            all_lists = page.locator('text="All Lists (AND)"')
-            if await all_lists.count() > 0:
-                await all_lists.first.click()
-                await page.wait_for_timeout(2000)
-                logger.debug("Selected 'All Lists (AND)' filter block")
-            else:
-                # Try "Any Lists (OR)" as fallback
-                any_lists = page.locator('text="Any Lists (OR)"')
-                if await any_lists.count() > 0:
-                    await any_lists.first.click()
+            # DataSift renamed "All Lists (AND)" to "All Custom Lists (AND)"
+            # (System Lists split out) — keep the old names as fallbacks.
+            for block_name in ["Any Custom Lists (OR)", "All Custom Lists (AND)",
+                               "Any Lists (OR)", "All Lists (AND)"]:
+                block = page.locator(f'text="{block_name}"')
+                if await block.count() > 0:
+                    await block.first.click()
                     await page.wait_for_timeout(2000)
-                    logger.debug("Selected 'Any Lists (OR)' filter block")
+                    logger.debug("Selected '%s' filter block", block_name)
+                    break
+            else:
+                logger.warning("No Lists filter block found")
+                return False
         else:
             logger.warning("Filter block search input not found")
+            return False
 
         await _screenshot(page, "filter_lists_block_added")
 
@@ -657,8 +680,12 @@ async def _filter_by_list(page: Page, list_name: str) -> bool:
                 await list_option.last.click()
                 await page.wait_for_timeout(1000)
                 logger.info("Selected list filter: %s", list_name)
+            else:
+                logger.warning("List '%s' not found in filter dropdown", list_name)
+                return False
         else:
             logger.warning("'Search for lists...' input not found")
+            return False
 
         await _screenshot(page, "filter_list_selected")
 
@@ -678,6 +705,10 @@ async def _filter_by_list(page: Page, list_name: str) -> bool:
             await page.wait_for_timeout(2000)
 
         await _screenshot(page, "filter_applied")
+        # The "Filtering by: ..." chip only appears once the filter is live
+        if await page.locator('text="Filtering by:"').count() == 0:
+            logger.warning("Filter chip not shown — list filter not applied")
+            return False
         return True
     except Exception as e:
         logger.warning("Filter by list failed: %s", e)
@@ -686,7 +717,13 @@ async def _filter_by_list(page: Page, list_name: str) -> bool:
 
 
 async def _select_all_records(page: Page) -> bool:
-    """Select all records on the current page. Returns True if selected."""
+    """Select every record matching the current filter (all pages).
+
+    The header checkbox has a chevron dropdown ("Choose selection") with
+    "Select visible (10)" / "Select all (N)" — only "Select all" covers records
+    beyond the first page. Returns True once the table header confirms the
+    selection ("Selecting N properties").
+    """
     try:
         # Dismiss popups aggressively — the notification popup blocks all clicks
         await _dismiss_popups(page)
@@ -696,83 +733,33 @@ async def _select_all_records(page: Page) -> bool:
 
         await _screenshot(page, "before_select_all")
 
-        # Strategy 1: Find the header checkbox position via JS, then use Playwright
-        # mouse.click to properly trigger React's event system.
-        # The header checkbox is near the "OWNER" column header text.
-        header_pos = await page.evaluate("""() => {
-            // Find the OWNER header text element
-            const allEls = document.querySelectorAll('*');
-            for (const el of allEls) {
-                if (el.textContent.trim() === 'OWNER' && el.children.length === 0) {
-                    const rect = el.getBoundingClientRect();
-                    // The header checkbox is in the same row, to the left
-                    // Find the nearest checkbox (same vertical position)
-                    const checkboxes = document.querySelectorAll('input[type="checkbox"]');
-                    let best = null;
-                    let bestDist = Infinity;
-                    for (const cb of checkboxes) {
-                        if (cb.classList.contains('react-toggle-screenreader-only')) continue;
-                        const cbRect = cb.getBoundingClientRect();
-                        // Must be roughly same Y position (within 30px) and to the left
-                        const yDist = Math.abs(cbRect.top - rect.top);
-                        if (yDist < 30 && cbRect.left < rect.left) {
-                            if (yDist < bestDist) {
-                                bestDist = yDist;
-                                best = cbRect;
-                            }
-                        }
-                    }
-                    if (best) {
-                        return {x: best.left + best.width/2, y: best.top + best.height/2};
-                    }
-                }
-            }
-            return null;
-        }""")
+        chevron = page.locator('[class*="CheckboxDropdownInnerContainer"] svg').last
+        if await chevron.count() == 0:
+            logger.warning("Select-all dropdown not found")
+            return False
+        await chevron.click()
+        await page.wait_for_timeout(1000)
 
-        if header_pos:
-            # Use Playwright mouse click which properly triggers React events
-            await page.mouse.click(header_pos["x"], header_pos["y"])
-            clicked_header = f"clicked at ({header_pos['x']:.0f}, {header_pos['y']:.0f})"
-            logger.info("Clicked header checkbox via coordinates: %s", clicked_header)
-            await page.wait_for_timeout(1500)
-        else:
-            clicked_header = None
-
-        if clicked_header:
-            logger.info("Clicked header checkbox via JS: %s", clicked_header)
-            await page.wait_for_timeout(1500)
-        else:
-            # Strategy 2: Click each record checkbox individually via JS
-            clicked_count = await page.evaluate("""() => {
-                const checkboxes = document.querySelectorAll('input[type="checkbox"]');
-                let clicked = 0;
-                for (const cb of checkboxes) {
-                    if (cb.classList.contains('react-toggle-screenreader-only')) continue;
-                    cb.click();
-                    clicked++;
-                }
-                return clicked;
-            }""")
-            logger.info("Clicked %d checkboxes via JS (all non-toggle)", clicked_count)
-            await page.wait_for_timeout(1500)
-
-        await _screenshot(page, "records_selected_header")
-
-        # After checking the header checkbox, a "Select All X records" banner may appear
-        select_all_link = page.locator('text="Select all"')
-        if await select_all_link.count() > 0:
-            await select_all_link.first.click()
-            await page.wait_for_timeout(1000)
-            logger.debug("Clicked 'Select all' records link")
-
-        # Verify: check if Manage or Send To buttons are now visible
-        manage_visible = await page.locator('button:has-text("Manage")').count() > 0
-        send_to_visible = await page.locator('button:has-text("Send To")').count() > 0
-        logger.info("After select: Manage visible=%s, Send To visible=%s", manage_visible, send_to_visible)
+        select_all = page.locator('[class*="CheckboxDropdown"]').get_by_text(
+            re.compile(r"^Select all \(\d[\d,]*\)$"))
+        if await select_all.count() == 0:
+            select_all = page.get_by_text(re.compile(r"^Select all \(\d[\d,]*\)$"))
+        if await select_all.count() == 0:
+            await _screenshot(page, "select_all_no_option")
+            logger.warning("'Select all (N)' option not found")
+            return False
+        label = (await select_all.first.text_content() or "").strip()
+        await select_all.first.click()
+        await page.wait_for_timeout(1500)
+        logger.info("Clicked '%s'", label)
 
         await _screenshot(page, "records_selected")
-        return manage_visible or send_to_visible
+        selecting = page.get_by_text(re.compile(r"Selecting [\d,]+ propert"))
+        if await selecting.count() == 0:
+            logger.warning("Selection not confirmed in table header")
+            return False
+        logger.info("%s", (await selecting.first.text_content() or "").strip())
+        return True
     except Exception as e:
         logger.warning("Select all records failed: %s", e)
         await _screenshot(page, "select_all_failed")
@@ -805,9 +792,10 @@ async def enrich_records(page: Page, list_name: str) -> dict:
         # Filter to the uploaded list
         filtered = await _filter_by_list(page, list_name)
         if not filtered:
+            # Select-all would otherwise grab every record in the account
             result["message"] = "Could not filter to list for enrichment"
-            logger.warning(result["message"])
-            # Continue anyway — may enrich whatever is showing
+            logger.error(result["message"])
+            return result
 
         # Select all records
         selected = await _select_all_records(page)
@@ -959,7 +947,10 @@ async def skip_trace_records(page: Page, list_name: str) -> dict:
         # Filter to the uploaded list
         filtered = await _filter_by_list(page, list_name)
         if not filtered:
-            logger.warning("Could not filter to list for skip trace — continuing anyway")
+            # Select-all would otherwise grab every record in the account
+            result["message"] = "Could not filter to list for skip trace"
+            logger.error(result["message"])
+            return result
 
         # Select all records
         selected = await _select_all_records(page)
