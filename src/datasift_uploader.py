@@ -1041,6 +1041,14 @@ async def skip_trace_records(page: Page, list_name: str) -> dict:
 
         await _screenshot(page, "skip_submitted")
 
+        # Pay-per-record accounts (no Unlimited add-on) with no credit balance
+        # get an "Insufficient balance!" banner and nothing is traced
+        if await page.locator('text="Insufficient balance!"').count() > 0:
+            result["message"] = ("Skip trace not run: insufficient DataSift balance "
+                                 "(no Unlimited Skip Trace add-on — buy credits or the add-on)")
+            logger.error(result["message"])
+            return result
+
         # Skip trace runs in background — we don't need to wait
         result["success"] = True
         result["message"] = "Skip trace started — track progress in Activity → Skip Trace tab"
